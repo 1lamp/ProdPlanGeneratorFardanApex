@@ -1,0 +1,11 @@
+{
+    "order_file_path": "",
+    "database_file_path": "",
+    "output_base_path": "",
+    "order_pdf_source_path": "",
+    "delete_temp_files": true,
+    "file_operation": "copy",
+    "print_preparation_pdf": true,
+    "print_timing_pdf": true,
+    "create_preparation_excel": true
+}

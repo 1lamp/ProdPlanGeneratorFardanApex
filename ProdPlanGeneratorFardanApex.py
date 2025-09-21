@@ -28,7 +28,6 @@ from PyQt5.QtGui import QFont, QIcon, QPixmap, QPainter, QFontDatabase
 # تابع کمکی برای یافتن مسیر فایل‌ها
 # ==============================================================================
 def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
         base_path = sys._MEIPASS
     except Exception:
@@ -62,7 +61,10 @@ class ConfigManager:
             "output_base_path": "",
             "order_pdf_source_path": "",
             "delete_temp_files": True,
-            "file_operation": "copy"
+            "file_operation": "copy",
+            "create_preparation_excel": True,
+            "print_preparation_pdf": True,
+            "print_timing_pdf": True
         }
         self.save()
 
@@ -71,27 +73,46 @@ CONFIG = ConfigManager()
 # ==============================================================================
 # بخش ثابت‌ها
 # ==============================================================================
+# --- نام شیت‌ها و ستون‌ها ---
 ORDER_SHEET_NAME = "OrderList"
 DATABASE_SHEET_NAME = "LOM"
 COL_ORDER_NUM = "شماره سفارش"
 COL_PRODUCT_CODE = "کد محصول"
 COL_QUANTITY = " تعداد"
+
+# --- سلول‌های ورودی در شیت LOM ---
 CELL_PRODUCT_CODE = "I4"
 CELL_CHECK = "D1"
 CELL_QUANTITY = "J6"
 CELL_ORDER_NUM_DB = "W3"
+
+# --- لیست کارهای چاپ از شیت اصلی (LOM) ---
 LOM_PRINT_JOBS = [
     {"suffix": "LOM", "type": "main"},
     {"suffix": "زمانسنجی", "type": "timing"},
     {"suffix": "آماده سازی", "type": "preparation"}
 ]
+
+# --- پارامتر کنترل شرطی ---
 CONDITIONAL_CHECK_CELL = 'D3'
+
+# --- برگه‌های شرطی ---
 MF_SHEET_NAME = "برنامه فنرپیچ"
 ST_SHEET_NAME = "برنامه سیم تابنده"
 KL_SHEET_NAME = "برنامه خم لوله‌ای"
-MF_CONFIG = {"print_range": "B2:Y54", "cell_product": "K5", "cell_order": "W5", "cell_flag": "Z47", "check_cell": "P49"}
-ST_CONFIG = {"print_range": "B2:Y68", "cell_product": "G7", "cell_flag": "Z63", "check_cell": "P64"}
-KL_CONFIG = {"print_range": "B1:L41", "cell_product": "E2"}
+
+# --- تنظیمات چاپ برگه‌های شرطی ---
+MF_CONFIG = {
+    "print_range": "B2:Y54", "cell_product": "K5", "cell_order": "W5",
+    "cell_flag": "Z47", "check_cell": "P49"
+}
+ST_CONFIG = {
+    "print_range": "B2:Y68", "cell_product": "G7",
+    "cell_flag": "Z63", "check_cell": "P64"
+}
+KL_CONFIG = {
+    "print_range": "B1:L41", "cell_product": "E2"
+}
 
 # ==============================================================================
 # منطق اصلی برنامه
@@ -125,10 +146,10 @@ class Worker(QObject):
                 check_val = str(sheet.range(config['check_cell']).value).strip().upper()
                 sheet.range(config['cell_flag']).value = (check_val == 'FALSE')
             sheet.range(config['print_range']).api.ExportAsFixedFormat(0, pdf_filepath)
-            self.status_update.emit(f"    - چاپ شرطی ({sheet.name}): {os.path.basename(pdf_filepath)}\n")
+            self.status_update.emit(f"       ✔ چاپ {sheet.name} انجام شد:\n              - نام فایل: {os.path.basename(pdf_filepath)}\n")
             return True
         except Exception as e:
-            self.status_update.emit(f"    - خطا در چاپ شیت '{sheet.name}': {e}\n")
+            self.status_update.emit(f"    ✘ خطا در چاپ {sheet.name}: {e}\n")
             return False
 
     def run(self):
@@ -150,7 +171,7 @@ class Worker(QObject):
             }
 
             if not all([order_file_path, database_file_path, output_base_path, order_pdf_source_path]):
-                self.error_signal.emit("مسیرها تنظیم نشده", "لطفاً از بخش تنظیمات، تمام مسیرهای اصلی را مشخص کنید.")
+                self.error_signal.emit("مسیرها تنظیم نشده", "لطفا از بخش تنظیمات، تمام مسیرهای اصلی را مشخص کنید.")
                 self.finished.emit()
                 return
 
@@ -162,7 +183,7 @@ class Worker(QObject):
             order_numbers_int = [int(num) for num in order_numbers_list]
 
             self.status_update.emit(f"شماره‌های سفارش برای پردازش:\n{order_numbers_list}\n")
-            self.status_update.emit(f"در حال خواندن فایل سفارش‌ها...\n")
+            self.status_update.emit(f"⏳ در حال خواندن فایل سفارش‌ها...\n")
             df = pd.read_excel(order_file_path, sheet_name=ORDER_SHEET_NAME, engine='openpyxl')
             df.columns = df.columns.str.strip()
             filtered_df = df[df[COL_ORDER_NUM.strip()].isin(order_numbers_int)]
@@ -171,20 +192,26 @@ class Worker(QObject):
                 self.warning_signal.emit("یافت نشد", "هیچ آیتمی مطابق با شماره سفارش‌های وارد شده در اکسل سفارش‌ها یافت نشد.")
                 self.finished.emit()
                 return
-            self.status_update.emit(f"تعداد {len(filtered_df)} آیتم برای پردازش یافت شد.\n")
+            self.status_update.emit(f"   🔎 تعداد {len(filtered_df)} آیتم برای پردازش یافت شد.\n")
 
-            self.status_update.emit("شروع پردازش اکسل دیتابیس و چاپ برگه‌ها...\n")
+            self.status_update.emit("   🌀 شروع پردازش اکسل دیتابیس و چاپ برگه‌ها . . .\n")
             with xw.App(visible=False) as app:
                 db_wb = app.books.open(database_file_path, read_only=True)
                 db_sheet = db_wb.sheets[DATABASE_SHEET_NAME]
 
                 for order_num, group in filtered_df.groupby(COL_ORDER_NUM.strip()):
-                    self.status_update.emit(f"===== شروع پردازش سفارش شماره: {order_num} =====\n")
+                    self.status_update.emit(f"=====   شروع پردازش سفارش شماره: {order_num}   =====\n")
                     order_folder = os.path.join(output_base_path, str(order_num))
                     os.makedirs(order_folder, exist_ok=True)
                     main_merger, preparation_merger, timing_merger = PdfWriter(), PdfWriter(), PdfWriter()
                     files_to_delete, original_order_filename = [], None
                     
+                    preparation_excel_data = []
+                    preparation_excel_headers = [
+                        "ردیف", "شماره سفارش", "کد محصول", "شرح کالا", "تعداد",
+                        "اندازه برش", "تاریخ نیاز", "توضیحات", "امضای تحویل گیرنده"
+                    ]
+
                     try:
                         search_pattern = f"({order_num})"
                         for filename in os.listdir(order_pdf_source_path):
@@ -194,10 +221,10 @@ class Worker(QObject):
                                 
                                 if self.config['file_operation'] == 'cut':
                                     shutil.move(source_filepath, dest_filepath)
-                                    self.status_update.emit(f"  - فایل اصلی سفارش '{filename}' منتقل (Cut) شد.\n")
+                                    self.status_update.emit(f"  ✔ فایل اصلی سفارش {order_num} منتقل شد:\n    {filename}\n")
                                 else:
                                     shutil.copy(source_filepath, dest_filepath)
-                                    self.status_update.emit(f"  - فایل اصلی سفارش '{filename}' کپی (Copy) شد.\n")
+                                    self.status_update.emit(f"  ✔ فایل اصلی سفارش {order_num} کپی شد:\n    {filename}\n")
                                 
                                 main_merger.append(dest_filepath)
                                 files_to_delete.append(dest_filepath)
@@ -211,7 +238,7 @@ class Worker(QObject):
                     for _, row in group.iterrows():
                         original_product_code = str(row[COL_PRODUCT_CODE.strip()])
                         quantity = row[COL_QUANTITY.strip()]
-                        self.status_update.emit(f"-> بررسی محصول: {original_product_code}\n")
+                        self.status_update.emit(f"✨ بررسی محصول کد {original_product_code}\n")
                         valid_product_codes = []
                         db_sheet.range(CELL_PRODUCT_CODE).value = original_product_code
                         if str(db_sheet.range(CELL_CHECK).value).strip().lower() != 'empty':
@@ -224,35 +251,62 @@ class Worker(QObject):
                                     valid_product_codes.append(variant_code)
                                 else: break
                         if not valid_product_codes:
-                            self.status_update.emit(f"  - هشدار: محصول {original_product_code} نامعتبر است. این آیتم نادیده گرفته شد.\n")
+                            self.status_update.emit(f"  ❗ هشدار: محصول {original_product_code} نامعتبر است. این آیتم نادیده گرفته شد.\n")
                             continue
                         for final_code in valid_product_codes:
-                            self.status_update.emit(f"  * شروع فرآیند چاپ برای محصول: {final_code}\n")
+                            self.status_update.emit(f"  ⏳ شروع فرآیند چاپ برای محصول {final_code}\n")
                             db_sheet.range(CELL_ORDER_NUM_DB).value = order_num
                             db_sheet.range(CELL_QUANTITY).value = quantity
                             db_sheet.range(CELL_PRODUCT_CODE).value = final_code
+                            
                             for job in LOM_PRINT_JOBS:
                                 suffix, job_type = job['suffix'], job['type']
-                                should_print, print_range = True, ""
+                                has_data, print_range = True, ""
+
                                 if suffix == "LOM":
                                     last_row = self.find_last_numeric_row(db_sheet, 'B5:B65'); print_range = f"B1:G{last_row}" if last_row > 0 else ""
                                 elif suffix == "زمانسنجی":
-                                    if db_sheet.range('P9').value is None: should_print = False
+                                    if db_sheet.range('P9').value is None: has_data = False
                                     else: last_row = self.find_last_numeric_row(db_sheet, 'N9:N47'); print_range = f"N4:Q{last_row}" if last_row > 0 else ""
                                 elif suffix == "آماده سازی":
-                                    if db_sheet.range('U5').value is None: should_print = False
+                                    if db_sheet.range('U5').value is None: has_data = False
                                     else: last_row = self.find_last_numeric_row(db_sheet, 'S5:S24'); print_range = f"S1:Y{last_row}" if last_row > 0 else ""
-                                if not print_range: should_print = False
-                                if should_print:
+                                
+                                if not print_range: has_data = False
+
+                                if not has_data:
+                                    continue
+
+                                print_this_pdf = True
+                                if suffix == "زمانسنجی" and not self.config.get('print_timing_pdf', True):
+                                    print_this_pdf = False
+
+                                if suffix == "آماده سازی" and not self.config.get('print_preparation_pdf', True):
+                                    print_this_pdf = False
+
+                                if print_this_pdf:
                                     pdf_filepath = os.path.join(order_folder, f"{final_code}_{suffix}.pdf")
                                     db_sheet.range(print_range).api.ExportAsFixedFormat(0, pdf_filepath)
                                     files_to_delete.append(pdf_filepath)
                                     if job_type == 'main': main_merger.append(pdf_filepath)
                                     elif job_type == 'preparation': preparation_merger.append(pdf_filepath)
                                     elif job_type == 'timing': timing_merger.append(pdf_filepath)
-                                    self.status_update.emit(f"    - فایل ({suffix}) ذخیره و به لیست مربوطه اضافه شد.\n")
-                                else:
-                                    self.status_update.emit(f"    - چاپ '{suffix}' به دلیل نبود اطلاعات لغو شد.\n")
+                                    self.status_update.emit(f"      ✔ فایل {suffix} ذخیره و به لیست مربوطه اضافه شد.\n")
+
+                                if suffix == "آماده سازی" and self.config.get('create_preparation_excel', True):
+                                    try:
+                                        prep_data_range = db_sheet.range('T5:V24').options(ndim=2).value
+                                        for row_data in prep_data_range:
+                                            if row_data[0]:
+                                                new_row = {
+                                                    "شماره سفارش": order_num, "کد محصول": final_code,
+                                                    "شرح کالا": row_data[0], "تعداد": row_data[1], "اندازه برش": row_data[2]
+                                                }
+                                                preparation_excel_data.append(new_row)
+                                        self.status_update.emit(f"      ✔ داده‌های آماده‌سازی برای اکسل استخراج شد.\n")
+                                    except Exception as e:
+                                        self.status_update.emit(f"      ✘ خطا در استخراج داده‌های آماده‌سازی برای اکسل: {e}\n")
+
                             process_code = str(db_sheet.range(CONDITIONAL_CHECK_CELL).value)[:2].upper()
                             if process_code == 'MF':
                                 mf_sheet = db_wb.sheets[MF_SHEET_NAME]
@@ -277,37 +331,66 @@ class Worker(QObject):
                                     shutil.copy(source_drawing_path, dest_drawing_path)
                                     main_merger.append(dest_drawing_path)
                                     files_to_delete.append(dest_drawing_path)
-                                    self.status_update.emit(f"    - نقشه فنی کپی و به لیست اصلی اضافه شد.\n")
+                                    self.status_update.emit(f"      ✔ نقشه فنی کپی و به لیست اصلی اضافه شد.\n")
                                 else:
-                                    self.status_update.emit(f"    - هشدار: نقشه فنی '{os.path.basename(source_drawing_path)}' یافت نشد.\n")
+                                    self.status_update.emit(f"      ✘ هشدار: نقشه فنی {os.path.basename(source_drawing_path)} یافت نشد.\n")
                     
+                    final_main_pdf_path = None
                     if len(main_merger.pages) > 0:
-                        clean_name = str(order_num)
-                        if original_order_filename: clean_name = re.sub(r'[\s_]?ok$', '', original_order_filename, flags=re.IGNORECASE).replace('.pdf', '').strip()
-                        output_path = os.path.join(order_folder, f"{clean_name}.pdf")
-                        with open(output_path, "wb") as f: main_merger.write(f)
-                        self.status_update.emit(f"  -> فایل اصلی ادغام شده برای سفارش {order_num} ذخیره شد.\n")
+                        clean_name = str(order_num) 
+                        if original_order_filename: 
+                            base_name = os.path.splitext(original_order_filename)[0]
+                            clean_name = re.sub(r'\s*ok$', '', base_name, flags=re.IGNORECASE).strip()
+
+                        final_main_pdf_path = os.path.join(order_folder, f"{clean_name}.pdf")
+                        with open(final_main_pdf_path, "wb") as f: 
+                            main_merger.write(f)
+                        self.status_update.emit(f"  ✔️ فایل اصلی ادغام شده برای سفارش {order_num} ذخیره شد.\n")
+
                     if len(preparation_merger.pages) > 0:
-                        with open(os.path.join(order_folder, f"آماده سازی({order_num}).pdf"), "wb") as f: preparation_merger.write(f)
-                        self.status_update.emit(f"  -> فایل 'آماده سازی' ادغام شده برای سفارش {order_num} ذخیره شد.\n")
-                    if len(timing_merger.pages) > 0:
-                        with open(os.path.join(order_folder, f"زمانسنجی({order_num}).pdf"), "wb") as f: timing_merger.write(f)
-                        self.status_update.emit(f"  -> فایل 'زمانسنجی' ادغام شده برای سفارش {order_num} ذخیره شد.\n")
+                        with open(os.path.join(order_folder, f"آماده سازی({order_num}).pdf"), "wb") as f: 
+                            preparation_merger.write(f)
+                        self.status_update.emit(f"  ✔️ فایل آماده سازی ادغام شده برای سفارش {order_num} ذخیره شد.\n")
                     
-                    main_merger.close(); preparation_merger.close(); timing_merger.close()
+                    if len(timing_merger.pages) > 0:
+                        with open(os.path.join(order_folder, f"زمانسنجی({order_num}).pdf"), "wb") as f: 
+                            timing_merger.write(f)
+                        self.status_update.emit(f"  ✔️ فایل زمانسنجی ادغام شده برای سفارش {order_num} ذخیره شد.\n")
+
+                    if self.config.get('create_preparation_excel', False) and preparation_excel_data:
+                        try:
+                            prep_excel_path = os.path.join(order_folder, f"آماده سازی({order_num}).xlsx")
+                            df_prep = pd.DataFrame(preparation_excel_data)
+                            df_prep.insert(0, 'ردیف', range(1, len(df_prep) + 1))
+                            df_prep = df_prep.reindex(columns=preparation_excel_headers)
+                            df_prep.to_excel(prep_excel_path, index=False, engine='openpyxl')
+                            self.status_update.emit(f"  ✔️ فایل اکسل آماده سازی برای سفارش {order_num} ذخیره شد.\n")
+                        except Exception as e:
+                            self.status_update.emit(f"  ✘ خطا در ذخیره فایل اکسل آماده سازی: {e}\n")
+                    
+                    main_merger.close()
+                    preparation_merger.close()
+                    timing_merger.close()
 
                     if self.config['delete_temp_files'] and files_to_delete:
-                        self.status_update.emit(f"  -> شروع پاکسازی فایل‌های موقت برای سفارش {order_num}...\n")
+                        self.status_update.emit(f"\n  ⏳ شروع پاکسازی فایل‌های موقت برای سفارش {order_num}...\n")
+                        
+                        if final_main_pdf_path and final_main_pdf_path in files_to_delete:
+                            files_to_delete.remove(final_main_pdf_path)
+                            self.status_update.emit(f"    - فایل نهایی {os.path.basename(final_main_pdf_path)} از لیست حذف خارج شد.\n")
+                        
                         deleted_count = 0
                         for file_path in files_to_delete:
                             try:
-                                if os.path.exists(file_path): os.remove(file_path); deleted_count += 1
+                                if os.path.exists(file_path): 
+                                    os.remove(file_path)
+                                    deleted_count += 1
                             except Exception as e:
-                                self.status_update.emit(f"    - خطا در حذف فایل {os.path.basename(file_path)}: {e}\n")
-                        self.status_update.emit(f"    - {deleted_count} فایل موقت با موفقیت حذف شد.\n")
-                
+                                self.status_update.emit(f"    ❗ خطا در حذف فایل {os.path.basename(file_path)}: {e}\n")
+                        self.status_update.emit(f"    ✔ {deleted_count} فایل موقت با موفقیت حذف شد.\n")
+
                 db_wb.close()
-                self.status_update.emit("\nعملیات پردازش، ساخت، ادغام و پاکسازی با موفقیت به پایان رسید.\n")
+                self.status_update.emit("\n💯 عملیات پردازش با موفقیت به پایان رسید. 🎉\n\n")
                 self.info_signal.emit("اتمام عملیات", "تمام سفارش‌ها با موفقیت پردازش شدند.")
         except FileNotFoundError as e:
             self.error_signal.emit("خطای فایل", f"فایل یا مسیر مورد نظر یافت نشد:\n{e.filename}\n\nلطفا از صحت مسیرها در بخش تنظیمات اطمینان حاصل کنید.")
@@ -348,10 +431,13 @@ class SettingsDialog(QDialog):
         options_group = QGroupBox("گزینه‌های پردازش")
         options_layout = QVBoxLayout()
         
+        self.print_prep_pdf_checkbox = QCheckBox("فایل آماده‌سازی چاپ شود PDF")
+        self.print_timing_pdf_checkbox = QCheckBox("فایل زمانسنجی چاپ شود PDF")
+        self.create_prep_excel_checkbox = QCheckBox("فایل اکسل آماده‌سازی ایجاد شود")
         self.delete_temp_checkbox = QCheckBox("پس از پایان پردازش، فایل‌های موقت پاک شوند")
         
         op_layout = QHBoxLayout()
-        op_label = QLabel("عملیات انتقال فایل سفارش اصلی:")
+        op_label = QLabel("عملیات انتقال فایل اصلی سفارش:")
         self.copy_radio = QRadioButton("Copy")
         self.cut_radio = QRadioButton("Cut")
         op_layout.addWidget(op_label)
@@ -359,6 +445,9 @@ class SettingsDialog(QDialog):
         op_layout.addWidget(self.cut_radio)
         op_layout.addStretch()
 
+        options_layout.addWidget(self.print_prep_pdf_checkbox)
+        options_layout.addWidget(self.print_timing_pdf_checkbox)
+        options_layout.addWidget(self.create_prep_excel_checkbox)
         options_layout.addWidget(self.delete_temp_checkbox)
         options_layout.addLayout(op_layout)
         options_group.setLayout(options_layout)
@@ -384,7 +473,7 @@ class SettingsDialog(QDialog):
         label.setFixedWidth(150)
         line_edit = QLineEdit()
 
-        browse_button = QPushButton("انتخاب مسیر")
+        browse_button = QPushButton("انتخاب مسیر ⤷")
         browse_button.setObjectName("actionButton")
         browse_button.setFixedWidth(90)
         
@@ -400,12 +489,12 @@ class SettingsDialog(QDialog):
         return layout, line_edit
 
     def _browse_file(self, line_edit):
-        path, _ = QFileDialog.getOpenFileName(self, "انتخاب فایل", "", "Excel Files (*.xlsx *.xlsm)")
+        path, _ = QFileDialog.getOpenFileName(self, "انتخاب فایل 📄", "", "Excel Files (*.xlsx *.xlsm)")
         if path:
             line_edit.setText(path)
 
     def _browse_folder(self, line_edit):
-        path = QFileDialog.getExistingDirectory(self, "انتخاب پوشه")
+        path = QFileDialog.getExistingDirectory(self, "انتخاب پوشه 📁")
         if path:
             line_edit.setText(path)
 
@@ -414,6 +503,9 @@ class SettingsDialog(QDialog):
         for key, widget_tuple in self.path_widgets.items():
             widget_tuple[1].setText(settings.get(key, ""))
         
+        self.print_prep_pdf_checkbox.setChecked(settings.get("print_preparation_pdf", True))
+        self.print_timing_pdf_checkbox.setChecked(settings.get("print_timing_pdf", True))
+        self.create_prep_excel_checkbox.setChecked(settings.get("create_preparation_excel", True))
         self.delete_temp_checkbox.setChecked(settings.get("delete_temp_files", True))
         
         if settings.get("file_operation", "copy") == "cut":
@@ -429,6 +521,9 @@ class SettingsDialog(QDialog):
         for key, widget_tuple in self.path_widgets.items():
             self.config_manager.settings[key] = widget_tuple[1].text()
         
+        self.config_manager.settings["print_preparation_pdf"] = self.print_prep_pdf_checkbox.isChecked()
+        self.config_manager.settings["print_timing_pdf"] = self.print_timing_pdf_checkbox.isChecked()
+        self.config_manager.settings["create_preparation_excel"] = self.create_prep_excel_checkbox.isChecked()
         self.config_manager.settings["delete_temp_files"] = self.delete_temp_checkbox.isChecked()
         self.config_manager.settings["file_operation"] = "cut" if self.cut_radio.isChecked() else "copy"
         
@@ -453,9 +548,9 @@ class SettingsDialog(QDialog):
         intro_layout.setContentsMargins(0, 0, 0, 0)
         lbl_intro = QLabel(
             "<h3><b>Fardan Apex — ProdPlanGenerator</b></h3>"
-            "<h4>Order PDF Generator Application</h4><br>"
-            "This software automates processing factory orders by generating, organizing, and exporting production documents into structured PDF files.<br>"
-            "Version: 1.1.7 — © 2025 All Rights Reserved<br>"
+            "<h4>Order PDF Generator Application<br></h4>"
+            "Automates the generation of production order documents from Excel data into consolidated PDFs.<br>"
+            "Version: 1.2.0 — © 2025 All Rights Reserved<br>"
             "Developed exclusively for:<br>"
             "Garma Gostar Fardan Co."
         )
@@ -548,10 +643,8 @@ class ProdPlanApp(QWidget):
         input_group_box_layout = QVBoxLayout()
         self.order_input = QTextEdit()
         self.order_input.setPlaceholderText("هر شماره سفارش در یک خط جدید...")
-        self.process_button = QPushButton("پردازش سفارش‌ها")
+        self.process_button = QPushButton("🚀 پردازش سفارش‌ها")
         self.process_button.setObjectName("actionButton")
-        process_icon = self.style().standardIcon(QStyle.SP_DialogApplyButton)
-        self.process_button.setIcon(process_icon)
         input_group_box_layout.addWidget(self.order_input)
         input_group_box_layout.addWidget(self.process_button)
         input_group_box.setLayout(input_group_box_layout)
@@ -567,7 +660,7 @@ class ProdPlanApp(QWidget):
         right_pane_layout.addWidget(processing_status_group_box)
         top_layout.addLayout(right_pane_layout, 65)
         top_layout.addLayout(left_pane_layout, 35)
-        self.settings_button = QPushButton("تنظیمات")
+        self.settings_button = QPushButton("تنظیمات 🛠️")
         self.settings_button.setFixedHeight(45)
         
         bottom_layout.addWidget(self.settings_button)
@@ -599,7 +692,8 @@ class ProdPlanApp(QWidget):
             match = re.search(r'\((\d+)\)', filename)
             if match:
                 order_num = match.group(1)
-                if re.search(r'[\s_]?ok$', os.path.splitext(filename)[0], re.IGNORECASE):
+                base_name = os.path.splitext(filename)[0]
+                if re.search(r'\s*ok$', base_name, re.IGNORECASE):
                     if order_num not in confirmed_orders: confirmed_orders.append(order_num)
                 else:
                     if order_num not in pending_orders: pending_orders.append(order_num)
@@ -629,7 +723,7 @@ class ProdPlanApp(QWidget):
     def start_processing(self):
         order_numbers = self.order_input.toPlainText()
         if not order_numbers.strip():
-            QMessageBox.warning(self, "ورودی خالی", "لطفاً حداقل یک شماره سفارش وارد کنید.")
+            QMessageBox.warning(self, "ورودی خالی", "لطفا حداقل یک شماره سفارش وارد کنید.")
             return
         self.process_button.setDisabled(True); self.settings_button.setDisabled(True)
         self.status_box.clear()
@@ -711,6 +805,5 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 
 
