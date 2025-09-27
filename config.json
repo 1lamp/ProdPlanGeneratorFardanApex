@@ -5,7 +5,7 @@
     "order_pdf_source_path": "",
     "delete_temp_files": true,
     "file_operation": "copy",
+    "create_preparation_excel": true,
     "print_preparation_pdf": true,
-    "print_timing_pdf": true,
-    "create_preparation_excel": true
+    "print_timing_pdf": true
 }
