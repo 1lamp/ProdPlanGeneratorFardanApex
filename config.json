@@ -1,11 +1,11 @@
 {
-    "order_file_path": "",
-    "database_file_path": "",
-    "output_base_path": "",
-    "order_pdf_source_path": "",
+    "order_file_path": "\\\\fileserver\\Mohandesi\\Serializer\\orders.xlsx",
+    "database_file_path": "\\\\fileserver\\Mohandesi\\Database\\Database.xlsm",
+    "output_base_path": "\\\\fileserver\\Mohandesi\\سفارش ها",
+    "order_pdf_source_path": "\\\\fileserver\\Mohandesi\\سفارش ها",
     "delete_temp_files": true,
     "file_operation": "copy",
     "create_preparation_excel": true,
-    "print_preparation_pdf": true,
+    "print_preparation_pdf": false,
     "print_timing_pdf": true
 }
