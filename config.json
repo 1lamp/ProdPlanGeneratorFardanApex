@@ -1,8 +1,8 @@
 {
-    "order_file_path": "\\\\fileserver\\Mohandesi\\Serializer\\orders.xlsx",
-    "database_file_path": "\\\\fileserver\\Mohandesi\\Database\\Database.xlsm",
-    "output_base_path": "\\\\fileserver\\Mohandesi\\سفارش ها",
-    "order_pdf_source_path": "\\\\fileserver\\Mohandesi\\سفارش ها",
+    "order_file_path": "D:/MyWork/G.G.Fardan/row/orders.xlsx",
+    "database_file_path": "D:/MyWork/G.G.Fardan/row/Database/Database.xlsm",
+    "output_base_path": "D:/MyWork/G.G.Fardan/row",
+    "order_pdf_source_path": "D:/MyWork/G.G.Fardan/row",
     "delete_temp_files": true,
     "file_operation": "copy",
     "create_preparation_excel": true,
