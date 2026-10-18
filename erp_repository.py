@@ -89,6 +89,14 @@ class ErpRepository:
             serial_date_expression = (
                 f"MAX(od.[{timestamp_column}])" if timestamp_column else "CAST(NULL AS DATETIME2)"
             )
+            if timestamp_column:
+                order_by = (
+                    f"CASE WHEN {serial_date_expression} IS NULL THEN 1 ELSE 0 END, "
+                    f"{serial_date_expression} DESC, o.order_date DESC, o.order_id DESC"
+                )
+            else:
+                order_by = "o.order_date DESC, o.order_id DESC"
+
             cursor.execute(f"""
                 SELECT
                     o.order_id, o.order_number, o.order_date, c.company_name,
@@ -101,9 +109,7 @@ class ErpRepository:
                 GROUP BY o.order_id, o.order_number, o.order_date, c.company_name
                 HAVING COUNT(od.order_detail_id) > 0
                    AND COUNT(od.production_serial) = COUNT(od.order_detail_id)
-                ORDER BY
-                    CASE WHEN {serial_date_expression} IS NULL THEN 1 ELSE 0 END,
-                    {serial_date_expression} DESC, o.order_date DESC, o.order_id DESC
+                ORDER BY {order_by}
             """)
             columns = [column[0] for column in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()], bool(timestamp_column)
