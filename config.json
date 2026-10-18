@@ -1,10 +1,10 @@
 {
-    "order_file_path": "\\\\fileserver\\Mohandesi\\Serializer\\orders.xlsx",
     "database_file_path": "\\\\fileserver\\Mohandesi\\Database\\Database.xlsm",
     "output_base_path": "\\\\fileserver\\general\\public\\برنامه ریزی\\سفارشات",
-    "order_pdf_source_path": "\\\\fileserver\\general\\public\\برنامه ریزی\\سفارشات",
+    "sql_server": "",
+    "sql_database": "FARDAN_OLTP",
+    "sql_driver": "ODBC Driver 18 for SQL Server",
     "delete_temp_files": true,
-    "file_operation": "copy",
     "create_preparation_excel": true,
     "print_preparation_pdf": false,
     "print_timing_pdf": true

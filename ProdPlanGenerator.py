@@ -383,10 +383,24 @@ class Worker(QObject):
             self.status_update.emit(
                 f"⏳ در حال خواندن فایل سفارش‌ها . . .\n"
             )
-            df = pd.read_excel(order_file_path, sheet_name=ORDER_SHEET_NAME, engine='openpyxl')
+
+            # ~~~~~~~~~~~~~~~~ START OF DEFINITIVE FIX ~~~~~~~~~~~~~~~~
+            # ستون شماره سفارش را به صورت قطعی به عنوان متن (string) می خوانیم
+            # این کار تمام مشکلات مربوط به تبدیل عدد به اعشار (123.0) را حل می کند
+            order_col_name = COL_ORDER_NUM.strip()
+            df = pd.read_excel(
+                order_file_path, 
+                sheet_name=ORDER_SHEET_NAME, 
+                engine='openpyxl',
+                dtype={order_col_name: str}  # <--- این خط کد مشکل را حل می کند
+            )
+            # ~~~~~~~~~~~~~~~~ END OF DEFINITIVE FIX ~~~~~~~~~~~~~~~~~~
+
             df.columns = df.columns.str.strip()
-            # Ensure comparison is done between strings to avoid data type issues
-            filtered_df = df[df[COL_ORDER_NUM.strip()].astype(str).isin(order_numbers_list)]
+            
+            # حالا که ستون به صورت متن خوانده شده، فقط کافی است فاصله های خالی را حذف کنیم
+            order_series_cleaned = df[order_col_name].str.strip()
+            filtered_df = df[order_series_cleaned.isin(order_numbers_list)]
 
             if filtered_df.empty:
                 self.warning_signal.emit(
@@ -405,8 +419,9 @@ class Worker(QObject):
                 self.db_wb = app.books.open(database_file_path, read_only=True)
                 db_sheet = self.db_wb.sheets[DATABASE_SHEET_NAME]
 
-                for order_num, group in filtered_df.groupby(COL_ORDER_NUM.strip()):
-                    order_num_str = str(order_num)
+                # برای گروه بندی، از ستون اصلی DataFrame که نوع داده آن حفظ شده استفاده می کنیم
+                for order_num, group in filtered_df.groupby(order_col_name):
+                    order_num_str = str(order_num).strip()
                     self.status_update.emit(
                         f"=======   شروع پردازش سفارش شماره {order_num_str}   =======\n"
                     )
@@ -595,6 +610,13 @@ class Worker(QObject):
             self.status_update.emit(
                 f"خطا در یافتن فایل: {e}\n"
             )
+        except KeyError as e:
+            msg = (
+                f"ستون مورد انتظار در فایل اکسل یافت نشد: {e}\n\n"
+                "لطفا مطمئن شوید نام ستون‌ها در فایل اکسل سفارش‌ها صحیح است."
+            )
+            self.error_signal.emit("خطای ساختار فایل", msg)
+            self.status_update.emit(f"خطا در یافتن ستون: {e}\n")
         except Exception as e:
             self.error_signal.emit(
                 "خطای کلی", f"یک خطای ناشناخته در برنامه رخ داد:\n{e}"
@@ -767,7 +789,7 @@ class SettingsDialog(QDialog):
             "<h4>Order PDF Generator Application</h4><br>"
             "Automates the generation of production order documents "
             "from Excel data into consolidated PDFs.<br>"
-            "Version: 2.6.19 — © 2025 All Rights Reserved<br>"
+            "Version: 2.7.0 — © 2025 All Rights Reserved<br>"
             "Developed exclusively for:<br>"
             "Garma Gostar Fardan Co."
         )
