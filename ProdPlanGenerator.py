@@ -15,6 +15,8 @@ import sys
 import json
 import shutil
 
+import keyring
+
 from erp_repository import ErpRepository
 from order_sheet_pdf import create_order_sheet_pdf
 
@@ -28,7 +30,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QTextEdit, QLabel, QMessageBox, QSplashScreen, QProgressBar, QStyle,
     QGroupBox, QDialog, QLineEdit, QFileDialog, QCheckBox, QRadioButton,
-    QListWidget, QListWidgetItem
+    QListWidget, QListWidgetItem, QComboBox
 )
 
 # ==============================================================================
@@ -609,6 +611,48 @@ class SettingsDialog(QDialog):
         paths_group.setLayout(paths_layout)
         self.layout.addWidget(paths_group)
 
+        sql_group = QGroupBox("اتصال به پایگاه داده ERP")
+        sql_layout = QVBoxLayout()
+        self.sql_server_input = QLineEdit()
+        self.sql_server_input.setPlaceholderText("مثال: localhost یا 192.168.1.10,1433 یا SERVER\\INSTANCE")
+        self.sql_database_input = QLineEdit()
+        self.sql_database_input.setPlaceholderText("نام پایگاه داده")
+        self.sql_driver_input = QLineEdit()
+        self.sql_driver_input.setPlaceholderText("نام درایور ODBC نصب‌شده")
+        self.sql_auth_combo = QComboBox()
+        self.sql_auth_combo.addItem("احراز هویت ویندوز (Windows Authentication)", "windows")
+        self.sql_auth_combo.addItem("نام کاربری و رمز SQL Server", "sql")
+        self.sql_username_input = QLineEdit()
+        self.sql_username_input.setPlaceholderText("نام کاربری SQL؛ برای ویندوز خالی بماند")
+        self.sql_password_input = QLineEdit()
+        self.sql_password_input.setEchoMode(QLineEdit.Password)
+        self.sql_password_input.setPlaceholderText("برای تغییر رمز وارد کنید؛ خالی = استفاده از رمز ذخیره‌شده")
+        self.sql_password_input.setToolTip("رمز در Windows Credential Manager ذخیره می‌شود، نه در config.json.")
+
+        def add_sql_row(label_text, widget):
+            row = QHBoxLayout()
+            label = QLabel(label_text)
+            label.setFixedWidth(150)
+            row.addWidget(label)
+            row.addWidget(widget, 1)
+            sql_layout.addLayout(row)
+
+        add_sql_row("آدرس سرور:", self.sql_server_input)
+        add_sql_row("نام پایگاه داده:", self.sql_database_input)
+        add_sql_row("درایور ODBC:", self.sql_driver_input)
+        add_sql_row("روش ورود:", self.sql_auth_combo)
+        add_sql_row("نام کاربری:", self.sql_username_input)
+        add_sql_row("رمز عبور:", self.sql_password_input)
+        sql_buttons = QHBoxLayout()
+        self.test_sql_button = QPushButton("آزمایش اتصال")
+        self.test_sql_button.setObjectName("actionButton")
+        self.test_sql_button.clicked.connect(self._test_sql_connection)
+        sql_buttons.addWidget(self.test_sql_button)
+        sql_buttons.addStretch()
+        sql_layout.addLayout(sql_buttons)
+        sql_group.setLayout(sql_layout)
+        self.layout.addWidget(sql_group)
+
         options_group = QGroupBox("گزینه‌های پردازش")
         options_layout = QVBoxLayout()
         
@@ -688,6 +732,14 @@ class SettingsDialog(QDialog):
         for key, widget_tuple in self.path_widgets.items():
             widget_tuple[1].setText(settings.get(key, ""))
         
+        self.sql_server_input.setText(settings.get("sql_server", "localhost"))
+        self.sql_database_input.setText(settings.get("sql_database", "FARDAN_OLTP"))
+        self.sql_driver_input.setText(settings.get("sql_driver", "ODBC Driver 18 for SQL Server"))
+        auth_index = self.sql_auth_combo.findData(settings.get("sql_authentication", "windows"))
+        self.sql_auth_combo.setCurrentIndex(max(auth_index, 0))
+        self.sql_username_input.setText(settings.get("sql_username", ""))
+        self.sql_password_input.clear()
+
         self.print_prep_pdf_checkbox.setChecked(settings.get("print_preparation_pdf", True))
         self.print_timing_pdf_checkbox.setChecked(settings.get("print_timing_pdf", True))
         self.create_prep_excel_checkbox.setChecked(settings.get("create_preparation_excel", True))
@@ -708,7 +760,21 @@ class SettingsDialog(QDialog):
         for key, widget_tuple in self.path_widgets.items():
             self.config_manager.settings[key] = widget_tuple[1].text()
         
-        self.config_manager.settings["print_preparation_pdf"] = self.print_prep_pdf_checkbox.isChecked()
+        settings = self.config_manager.settings
+        settings["sql_server"] = self.sql_server_input.text().strip()
+        settings["sql_database"] = self.sql_database_input.text().strip()
+        settings["sql_driver"] = self.sql_driver_input.text().strip()
+        settings["sql_authentication"] = self.sql_auth_combo.currentData()
+        settings["sql_username"] = self.sql_username_input.text().strip() if settings["sql_authentication"] == "sql" else ""
+        entered_password = self.sql_password_input.text()
+        if entered_password and settings["sql_authentication"] == "sql":
+            keyring.set_password(
+                ErpRepository.credential_service(settings),
+                settings["sql_username"],
+                entered_password,
+            )
+
+        settings["print_preparation_pdf"] = self.print_prep_pdf_checkbox.isChecked()
         self.config_manager.settings["print_timing_pdf"] = self.print_timing_pdf_checkbox.isChecked()
         self.config_manager.settings["create_preparation_excel"] = self.create_prep_excel_checkbox.isChecked()
         self.config_manager.settings["delete_temp_files"] = self.delete_temp_checkbox.isChecked()
@@ -716,9 +782,38 @@ class SettingsDialog(QDialog):
         
         self.config_manager.save()
 
+    def _test_sql_connection(self):
+        """Validate the currently entered SQL settings without saving them."""
+        settings = dict(self.config_manager.settings)
+        settings.update({
+            "sql_server": self.sql_server_input.text().strip(),
+            "sql_database": self.sql_database_input.text().strip(),
+            "sql_driver": self.sql_driver_input.text().strip(),
+            "sql_authentication": self.sql_auth_combo.currentData(),
+            "sql_username": self.sql_username_input.text().strip() if self.sql_auth_combo.currentData() == "sql" else "",
+        })
+        try:
+            ErpRepository(settings).test_connection(password_override=self.sql_password_input.text() or None)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "اتصال ناموفق",
+                "اتصال به SQL Server برقرار نشد. آدرس، پورت، نام دیتابیس، درایور و مجوز ورود را بررسی کنید.\\n\\n"
+                f"جزئیات: {exc}",
+            )
+            return
+        QMessageBox.information(self, "اتصال موفق", "اتصال به پایگاه داده با موفقیت آزمایش شد.")
+
     def accept(self):
-        """ Overrides the default accept to save settings before closing. """
-        self._save_settings()
+        """Save settings and keep credentials out of the JSON configuration."""
+        try:
+            self._save_settings()
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "ذخیره تنظیمات ناموفق",
+                "تنظیمات ذخیره نشد. امکان ذخیره امن رمز در Windows Credential Manager وجود نداشت.\\n\\n"
+                f"جزئیات: {exc}",
+            )
+            return
         QMessageBox.information(self, "ذخیره شد", "تنظیمات با موفقیت ذخیره شد.")
         super().accept()
 
