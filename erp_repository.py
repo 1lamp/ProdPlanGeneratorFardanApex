@@ -1,5 +1,6 @@
 """Read-only access to Fardan ERP sales orders."""
 import os
+import keyring
 import pyodbc
 
 
@@ -21,17 +22,36 @@ class ErpRepository:
     def __init__(self, settings):
         self.settings = settings
 
-    def _connect(self):
+    @staticmethod
+    def credential_service(settings):
+        """Return a per-server credential key for Windows Credential Manager."""
+        server = (settings.get("sql_server") or "").strip()
+        database = (settings.get("sql_database") or "FARDAN_OLTP").strip()
+        return f"FardanApex.ProdPlanGenerator|{server}|{database}"
+
+    def _connect(self, password_override=None):
         server = os.getenv("FARDAN_SQL_SERVER") or self.settings.get("sql_server", "")
         database = os.getenv("FARDAN_SQL_DATABASE") or self.settings.get("sql_database", "FARDAN_OLTP")
         username = os.getenv("FARDAN_SQL_USERNAME") or self.settings.get("sql_username", "")
-        password = os.getenv("FARDAN_SQL_PASSWORD", "")
         driver = self.settings.get("sql_driver", "ODBC Driver 18 for SQL Server")
+        authentication = self.settings.get("sql_authentication", "sql" if username else "windows")
         if not server:
-            raise RuntimeError("آدرس SQL Server در تنظیمات یا متغیر FARDAN_SQL_SERVER تعیین نشده است.")
-        if username:
+            raise RuntimeError("آدرس SQL Server را در تنظیمات برنامه وارد کنید.")
+        if not database:
+            raise RuntimeError("نام پایگاه داده را در تنظیمات برنامه وارد کنید.")
+        if authentication == "sql":
+            if not username:
+                raise RuntimeError("برای احراز هویت SQL، نام کاربری را در تنظیمات وارد کنید.")
+            password = (
+                password_override
+                or os.getenv("FARDAN_SQL_PASSWORD")
+                or keyring.get_password(self.credential_service(self.settings), username)
+            )
             if not password:
-                raise RuntimeError("برای اتصال SQL با نام کاربری، متغیر محیطی FARDAN_SQL_PASSWORD را تنظیم کنید.")
+                raise RuntimeError(
+                    "رمز SQL ذخیره نشده است. رمز را در تنظیمات وارد و ذخیره کنید، "
+                    "یا متغیر محیطی FARDAN_SQL_PASSWORD را تنظیم کنید."
+                )
             auth = f"UID={username};PWD={password};"
         else:
             auth = "Trusted_Connection=yes;"
@@ -41,6 +61,11 @@ class ErpRepository:
             "ApplicationIntent=ReadOnly;"
         )
         return pyodbc.connect(connection_string, readonly=True, autocommit=True)
+
+    def test_connection(self, password_override=None):
+        """Open a read-only connection and run a harmless connectivity check."""
+        with self._connect(password_override=password_override) as connection:
+            connection.cursor().execute("SELECT 1").fetchone()
 
     @staticmethod
     def _has_serial_timestamp(cursor):
@@ -64,6 +89,14 @@ class ErpRepository:
             serial_date_expression = (
                 f"MAX(od.[{timestamp_column}])" if timestamp_column else "CAST(NULL AS DATETIME2)"
             )
+            if timestamp_column:
+                order_by = (
+                    f"CASE WHEN {serial_date_expression} IS NULL THEN 1 ELSE 0 END, "
+                    f"{serial_date_expression} DESC, o.order_date DESC, o.order_id DESC"
+                )
+            else:
+                order_by = "o.order_date DESC, o.order_id DESC"
+
             cursor.execute(f"""
                 SELECT
                     o.order_id, o.order_number, o.order_date, c.company_name,
@@ -76,9 +109,7 @@ class ErpRepository:
                 GROUP BY o.order_id, o.order_number, o.order_date, c.company_name
                 HAVING COUNT(od.order_detail_id) > 0
                    AND COUNT(od.production_serial) = COUNT(od.order_detail_id)
-                ORDER BY
-                    CASE WHEN {serial_date_expression} IS NULL THEN 1 ELSE 0 END,
-                    {serial_date_expression} DESC, o.order_date DESC, o.order_id DESC
+                ORDER BY {order_by}
             """)
             columns = [column[0] for column in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()], bool(timestamp_column)
