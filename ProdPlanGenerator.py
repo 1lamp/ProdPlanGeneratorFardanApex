@@ -15,6 +15,9 @@ import sys
 import json
 import shutil
 
+from erp_repository import ErpRepository
+from order_sheet_pdf import create_order_sheet_pdf
+
 # === Third-Party Libraries ===
 import pandas as pd
 import xlwings as xw
@@ -24,7 +27,8 @@ from PyQt5.QtGui import QFont, QIcon, QPixmap, QFontDatabase
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QTextEdit, QLabel, QMessageBox, QSplashScreen, QProgressBar, QStyle,
-    QGroupBox, QDialog, QLineEdit, QFileDialog, QCheckBox, QRadioButton
+    QGroupBox, QDialog, QLineEdit, QFileDialog, QCheckBox, QRadioButton,
+    QListWidget, QListWidgetItem
 )
 
 # ==============================================================================
@@ -64,10 +68,11 @@ class ConfigManager:
     def _create_default_config(self):
         """ Creates a default configuration file if one doesn't exist. """
         self.settings = {
-            "order_file_path": "",
             "database_file_path": "",
             "output_base_path": "",
-            "order_pdf_source_path": "",
+            "sql_server": "",
+            "sql_database": "FARDAN_OLTP",
+            "sql_driver": "ODBC Driver 18 for SQL Server",
             "delete_temp_files": True,
             "file_operation": "copy",
             "create_preparation_excel": True,
@@ -344,10 +349,8 @@ class Worker(QObject):
     def run(self):
         """ Main processing logic. """
         try:
-            order_file_path = os.path.normpath(self.config['order_file_path'])
             database_file_path = os.path.normpath(self.config['database_file_path'])
             output_base_path = os.path.normpath(self.config['output_base_path'])
-            order_pdf_source_path = os.path.normpath(self.config['order_pdf_source_path'])
             
             technical_drawing_paths = {
                 "TS": r"\\fileserver\mohandesi\PDF Plan\ترموسوئیچ",
@@ -360,10 +363,10 @@ class Worker(QObject):
                 "MR": r"\\fileserver\mohandesi\PDF Plan\میله ای\نقشه های معتبر"
             }
 
-            if not all([order_file_path, database_file_path, output_base_path, order_pdf_source_path]):
+            if not all([database_file_path, output_base_path]):
                 self.error_signal.emit(
                     "مسیرها تنظیم نشده",
-                    "لطفا از بخش تنظیمات، تمام مسیرهای اصلی را مشخص کنید."
+                    "لطفا مسیر فایل اکسل مهندسی و پوشه خروجی را در تنظیمات مشخص کنید."
                 )
                 self.finished.emit()
                 return
@@ -380,37 +383,21 @@ class Worker(QObject):
             self.status_update.emit(
                 f"شماره‌های سفارش برای پردازش:\n{order_numbers_list}\n"
             )
-            self.status_update.emit(
-                f"⏳ در حال خواندن فایل سفارش‌ها . . .\n"
-            )
-
-            # ~~~~~~~~~~~~~~~~ START OF DEFINITIVE FIX ~~~~~~~~~~~~~~~~
-            # ستون شماره سفارش را به صورت قطعی به عنوان متن (string) می خوانیم
-            # این کار تمام مشکلات مربوط به تبدیل عدد به اعشار (123.0) را حل می کند
-            order_col_name = COL_ORDER_NUM.strip()
-            df = pd.read_excel(
-                order_file_path, 
-                sheet_name=ORDER_SHEET_NAME, 
-                engine='openpyxl',
-                dtype={order_col_name: str}  # <--- این خط کد مشکل را حل می کند
-            )
-            # ~~~~~~~~~~~~~~~~ END OF DEFINITIVE FIX ~~~~~~~~~~~~~~~~~~
-
-            df.columns = df.columns.str.strip()
-            
-            # حالا که ستون به صورت متن خوانده شده، فقط کافی است فاصله های خالی را حذف کنیم
-            order_series_cleaned = df[order_col_name].str.strip()
-            filtered_df = df[order_series_cleaned.isin(order_numbers_list)]
-
-            if filtered_df.empty:
-                self.warning_signal.emit(
-                    "یافت نشد", "هیچ آیتمی مطابق با شماره سفارش‌های وارد شده در اکسل سفارش‌ها یافت نشد."
-                )
+            self.status_update.emit("⏳ در حال دریافت سفارش‌ها از ERP (فقط‌خواندنی) . . .\n")
+            erp_orders = ErpRepository(self.config).get_orders_for_processing(order_numbers_list)
+            if not erp_orders:
+                self.warning_signal.emit("یافت نشد", "برای شماره‌های واردشده، سفارش فعالی در ERP یافت نشد.")
                 self.finished.emit()
                 return
-            self.status_update.emit(
-                f"   🔎 تعداد {len(filtered_df)} آیتم برای پردازش یافت شد.\n"
-            )
+            rows = []
+            for order_number, order in erp_orders.items():
+                for item in order["items"]:
+                    rows.append({COL_ORDER_NUM: order_number, COL_PRODUCT_CODE: item.get("technical_code") or "", COL_QUANTITY: item.get("quantity") or 0})
+            filtered_df = pd.DataFrame(rows)
+            missing_orders = [number for number in order_numbers_list if number not in erp_orders]
+            if missing_orders:
+                self.status_update.emit(f"⚠️ سفارش‌های فعال یافت‌نشده: {', '.join(missing_orders)}\n")
+            self.status_update.emit(f"🔎 تعداد {len(filtered_df)} قلم از ERP دریافت شد.\n")
 
             self.status_update.emit(
                 "   🌀 شروع پردازش اکسل دیتابیس محصولات و چاپ برگه‌ها . . .\n"
@@ -419,9 +406,8 @@ class Worker(QObject):
                 self.db_wb = app.books.open(database_file_path, read_only=True)
                 db_sheet = self.db_wb.sheets[DATABASE_SHEET_NAME]
 
-                # برای گروه بندی، از ستون اصلی DataFrame که نوع داده آن حفظ شده استفاده می کنیم
-                for order_num, group in filtered_df.groupby(order_col_name):
-                    order_num_str = str(order_num).strip()
+                for order_num, group in filtered_df.groupby(COL_ORDER_NUM.strip()):
+                    order_num_str = str(order_num)
                     self.status_update.emit(
                         f"=======   شروع پردازش سفارش شماره {order_num_str}   =======\n"
                     )
@@ -429,7 +415,16 @@ class Worker(QObject):
                     os.makedirs(order_folder, exist_ok=True)
                     main_merger, preparation_merger, timing_merger = PdfWriter(), PdfWriter(), PdfWriter()
                     files_to_delete, original_order_filename = [], None
-                    
+                    order_metadata = erp_orders.get(order_num_str)
+                    if order_metadata:
+                        order_sheet_path = os.path.join(order_folder, f"برگه سفارش({order_num_str}).pdf")
+                        try:
+                            create_order_sheet_pdf(order_metadata, order_sheet_path, resource_path("IRAN.ttf"))
+                            main_merger.append(order_sheet_path)
+                            files_to_delete.append(order_sheet_path)
+                            self.status_update.emit(f"✔ برگه سفارش از ERP ساخته شد: {order_sheet_path}\n")
+                        except Exception as error:
+                            self.status_update.emit(f"✘ ساخت برگه سفارش ERP ناموفق بود: {error}\n")
                     preparation_excel_data = []
                     preparation_excel_headers = [
                         "ردیف",
@@ -443,37 +438,7 @@ class Worker(QObject):
                         "امضای تحویل گیرنده"
                     ]
 
-                    try:
-                        search_pattern = f"({order_num_str})"
-                        for filename in os.listdir(order_pdf_source_path):
-                            if search_pattern in filename and filename.lower().endswith('.pdf'):
-                                source_filepath = os.path.join(order_pdf_source_path, filename)
-                                dest_filepath = os.path.join(order_folder, filename)
-                                
-                                if self.config['file_operation'] == 'cut':
-                                    shutil.move(source_filepath, dest_filepath)
-                                    self.status_update.emit(
-                                        f"  ✔ فایل اصلی سفارش {order_num_str} منتقل شد:\n"
-                                    )
-                                else:
-                                    shutil.copy(source_filepath, dest_filepath)
-                                    self.status_update.emit(
-                                        f"  ✔ فایل اصلی سفارش {order_num_str} کپی شد:\n"
-                                    )
-                                
-                                main_merger.append(dest_filepath)
-                                files_to_delete.append(dest_filepath)
-                                original_order_filename = filename
-                                break
-                        if not original_order_filename:
-                            self.status_update.emit(
-                                f"  - هشدار: فایل سفارش {order_num_str} یافت نشد.\n"
-                            )
-                    except Exception as e:
-                        self.status_update.emit(
-                            f"  - خطا در انتقال فایل اصلی سفارش: {e}\n"
-                        )
-
+                    # Current order sheet is generated from ERP; legacy order PDFs are not used.
                     for _, row in group.iterrows():
                         original_product_code = str(row[COL_PRODUCT_CODE.strip()])
                         quantity = row[COL_QUANTITY.strip()]
@@ -541,11 +506,7 @@ class Worker(QObject):
                     
                     final_main_pdf_path = None
                     if len(main_merger.pages) > 0:
-                        clean_name = order_num_str 
-                        if original_order_filename: 
-                            base_name = os.path.splitext(original_order_filename)[0]
-                            clean_name = re.sub(r'\s*ok$', '', base_name, flags=re.IGNORECASE).strip()
-                        final_main_pdf_path = os.path.join(order_folder, f"{clean_name}.pdf")
+                        final_main_pdf_path = os.path.join(order_folder, f"{order_num_str}.pdf")
                         with open(final_main_pdf_path, "wb") as f: main_merger.write(f)
                         self.status_update.emit(f"  ✔ فایل اصلی ادغام شده برای سفارش {order_num_str} ذخیره شد.\n")
 
@@ -610,13 +571,6 @@ class Worker(QObject):
             self.status_update.emit(
                 f"خطا در یافتن فایل: {e}\n"
             )
-        except KeyError as e:
-            msg = (
-                f"ستون مورد انتظار در فایل اکسل یافت نشد: {e}\n\n"
-                "لطفا مطمئن شوید نام ستون‌ها در فایل اکسل سفارش‌ها صحیح است."
-            )
-            self.error_signal.emit("خطای ساختار فایل", msg)
-            self.status_update.emit(f"خطا در یافتن ستون: {e}\n")
         except Exception as e:
             self.error_signal.emit(
                 "خطای کلی", f"یک خطای ناشناخته در برنامه رخ داد:\n{e}"
@@ -647,9 +601,7 @@ class SettingsDialog(QDialog):
         paths_group = QGroupBox("تنظیمات مسیرها")
         paths_layout = QVBoxLayout()
         self.path_widgets = {
-            "order_file_path": self._create_path_selector("فایل اکسل سفارش‌ها:", "file"),
-            "database_file_path": self._create_path_selector("فایل اکسل دیتابیس:", "file"),
-            "order_pdf_source_path": self._create_path_selector("پوشه فایل‌های سفارش:", "folder"),
+            "database_file_path": self._create_path_selector("فایل اکسل مهندسی (.xlsm):", "file"),
             "output_base_path": self._create_path_selector("پوشه ذخیره خروجی:", "folder"),
         }
         for _, widget_tuple in self.path_widgets.items():
@@ -789,7 +741,7 @@ class SettingsDialog(QDialog):
             "<h4>Order PDF Generator Application</h4><br>"
             "Automates the generation of production order documents "
             "from Excel data into consolidated PDFs.<br>"
-            "Version: 2.7.0 — © 2025 All Rights Reserved<br>"
+            "Version: 2.6.19 — © 2025 All Rights Reserved<br>"
             "Developed exclusively for:<br>"
             "Garma Gostar Fardan Co."
         )
@@ -871,25 +823,20 @@ class ProdPlanApp(QWidget):
         refresh_icon = self.style().standardIcon(QStyle.SP_BrowserReload)
         self.refresh_button.setIcon(refresh_icon)
         
-        self.confirmed_title_label = QLabel("سفارش‌های تایید شده:")
-        self.confirmed_orders_label = QLabel("برای مشاهده لیست، روی بروزرسانی کلیک کنید.")
+        self.confirmed_title_label = QLabel("سفارش‌های آماده برنامه‌ریزی (تمام اقلام دارای سریال):")
+        self.confirmed_orders_label = QLabel("برای دریافت فهرست، روی بروزرسانی کلیک کنید.")
         self.confirmed_orders_label.setObjectName("confirmedOrders")
         self.confirmed_orders_label.setWordWrap(True)
-        
-        self.pending_title_label = QLabel("سفارش‌های در انتظار تایید:")
-        self.pending_orders_label = QLabel("برای مشاهده لیست، روی بروزرسانی کلیک کنید.")
-        self.pending_orders_label.setObjectName("pendingOrders")
-        self.pending_orders_label.setWordWrap(True)
-        
+        self.ready_orders_list = QListWidget()
+        self.ready_orders_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.add_selected_button = QPushButton("افزودن سفارش‌های انتخاب‌شده به ورودی")
+        self.add_selected_button.setObjectName("actionButton")
         status_group_box_layout.addWidget(self.confirmed_title_label)
+        status_group_box_layout.addWidget(self.ready_orders_list, 1)
         status_group_box_layout.addWidget(self.confirmed_orders_label)
-        status_group_box_layout.addSpacing(10)
-        status_group_box_layout.addWidget(self.pending_title_label)
-        status_group_box_layout.addWidget(self.pending_orders_label)
+        status_group_box_layout.addWidget(self.add_selected_button)
         status_group_box_layout.addWidget(self.refresh_button)
         status_group_box.setLayout(status_group_box_layout)
-        status_group_box.setFixedHeight(status_group_box.sizeHint().height() + 20)
-        
         input_group_box = QGroupBox("ورود شماره سفارش‌ها")
         input_group_box_layout = QVBoxLayout()
         self.order_input = QTextEdit()
@@ -932,42 +879,49 @@ class ProdPlanApp(QWidget):
         self.process_button.clicked.connect(self.start_processing)
         self.settings_button.clicked.connect(self.show_settings)
         self.refresh_button.clicked.connect(self.scan_order_directory)
+        self.add_selected_button.clicked.connect(self.add_selected_orders)
+        self.ready_orders_list.itemDoubleClicked.connect(lambda _item: self.add_selected_orders())
         
         self.apply_stylesheet()
 
     def scan_order_directory(self):
-        """ Scans the source directory in a background thread. """
-        path = CONFIG.settings.get('order_pdf_source_path')
-        if not path or not os.path.isdir(path):
-            msg = "مسیر پوشه سفارش‌ها تنظیم نشده یا نامعتبر است."
-            self.update_status(f"راهنما: {msg}")
-            self.confirmed_orders_label.setText("-")
-            self.pending_orders_label.setText("-")
-            return
-
+        """Refresh ready-to-plan orders from SQL Server in read-only mode."""
         self.refresh_button.setDisabled(True)
-        self.confirmed_orders_label.setText("در حال اسکن پوشه . . .")
-        self.pending_orders_label.setText("در حال اسکن پوشه . . .")
+        self.confirmed_orders_label.setText("در حال دریافت فهرست از ERP...")
+        self.ready_orders_list.clear()
+        try:
+            orders, has_serial_timestamp = ErpRepository(CONFIG.settings).list_ready_orders()
+            for order in orders:
+                order_number = str(order.get("order_number", "")).strip()
+                order_date = order.get("order_date")
+                serial_date = order.get("serial_approved_at")
+                order_date_text = order_date.strftime("%Y-%m-%d") if hasattr(order_date, "strftime") else str(order_date or "-")
+                serial_date_text = serial_date.strftime("%Y-%m-%d %H:%M") if hasattr(serial_date, "strftime") else "نامشخص"
+                company = order.get("company_name") or ""
+                label = f"{order_number} | سفارش: {order_date_text} | تأیید سریال: {serial_date_text} | {company} | اقلام: {order.get('item_count', 0)}"
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, order_number)
+                self.ready_orders_list.addItem(item)
+            if not has_serial_timestamp:
+                self.confirmed_orders_label.setText("⚠️ در شِمای فعلی ERP تاریخ ایجاد سریال وجود ندارد؛ تاریخ تأیید نمایش‌داده نمی‌شود.")
+            else:
+                self.confirmed_orders_label.setText(f"تعداد سفارش‌های آماده: {len(orders)}")
+            self.update_status(f"فهرست ERP بروزرسانی شد؛ {len(orders)} سفارش آماده یافت شد.")
+        except Exception as error:
+            self.confirmed_orders_label.setText("دریافت فهرست از ERP ناموفق بود.")
+            self.update_status(f"خطا در دریافت فهرست سفارش‌ها: {error}")
+            QMessageBox.warning(self, "خطای اتصال به ERP", str(error))
+        finally:
+            self.refresh_button.setDisabled(False)
 
-        self.scanner_thread = QThread()
-        self.scanner_worker = DirectoryScannerWorker(path)
-        self.scanner_worker.moveToThread(self.scanner_thread)
-
-        self.scanner_thread.started.connect(self.scanner_worker.run)
-        self.scanner_worker.scan_complete.connect(self.update_order_lists)
-        
-        self.scanner_worker.finished.connect(self.scanner_thread.quit)
-        self.scanner_worker.finished.connect(self.scanner_worker.deleteLater)
-        self.scanner_thread.finished.connect(self.scanner_thread.deleteLater)
-        self.scanner_thread.finished.connect(lambda: self.refresh_button.setDisabled(False))
-        
-        self.scanner_thread.start()
-
-    def update_order_lists(self, confirmed_orders, pending_orders):
-        """ Receives the results from the scanner worker and updates the UI. """
-        self.confirmed_orders_label.setText(" - ".join(sorted(confirmed_orders)) if confirmed_orders else "سفارش تایید شده‌ای یافت نشد")
-        self.pending_orders_label.setText(" - ".join(sorted(pending_orders)) if pending_orders else "سفارش تایید نشده‌ای یافت نشد")
-        self.update_status("لیست سفارش‌ها بروزرسانی شد.")
+    def add_selected_orders(self):
+        """Append selected ready order numbers to the manual processing input."""
+        selected = [str(item.data(Qt.UserRole)) for item in self.ready_orders_list.selectedItems()]
+        existing = {line.strip() for line in self.order_input.toPlainText().splitlines() if line.strip()}
+        for number in selected:
+            if number not in existing:
+                self.order_input.append(number)
+                existing.add(number)
 
     def apply_stylesheet(self):
         """ Applies a custom stylesheet to the application. """
@@ -987,7 +941,6 @@ class ProdPlanApp(QWidget):
                 padding: 0 5px; 
             }
             QLabel#confirmedOrders { color: #28a745; font-size: 10pt; }
-            QLabel#pendingOrders { color: #dc3545; font-size: 10pt; }
             QPushButton { 
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #5aa9ff, stop:1 #2e7dff); 
                 color: white; border: none; padding: 8px 10px; border-radius: 8px; 
@@ -1115,6 +1068,5 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 
 

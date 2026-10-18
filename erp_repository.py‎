@@ -14,6 +14,7 @@ def _extract_delivery_time(conditions):
     )
     return match.group(1).strip() if match and match.group(1).strip() else None
 
+
 class ErpRepository:
     """Provides parameterized, read-only queries to the Fardan OLTP database."""
 
