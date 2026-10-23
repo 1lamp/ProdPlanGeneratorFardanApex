@@ -1154,7 +1154,6 @@ def main():
             timer.stop()
             splash.close()
             main_window.show()
-            main_window.fit_to_screen(0.85)
 
     timer = QTimer()
     timer.timeout.connect(update_progress)
@@ -1164,5 +1163,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 
