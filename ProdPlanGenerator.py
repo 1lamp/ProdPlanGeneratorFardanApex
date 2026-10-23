@@ -903,7 +903,7 @@ class ProdPlanApp(QWidget):
         """ Initializes the UI components. """
         self.setWindowTitle("سازنده برگه‌های سفارش - ProdPlanGenerator - FardanApex")
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
-        self.setGeometry(250, 100, 900, 600)
+        self.resize(900, 600)
 
         main_layout = QVBoxLayout(self)
         top_layout = QHBoxLayout()
@@ -1154,6 +1154,7 @@ def main():
             timer.stop()
             splash.close()
             main_window.show()
+            main_window.fit_to_screen(0.85)
 
     timer = QTimer()
     timer.timeout.connect(update_progress)
