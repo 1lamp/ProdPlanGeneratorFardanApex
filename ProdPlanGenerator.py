@@ -76,7 +76,6 @@ class ConfigManager:
             "sql_database": "FARDAN_OLTP",
             "sql_driver": "ODBC Driver 18 for SQL Server",
             "delete_temp_files": True,
-            "file_operation": "copy",
             "create_preparation_excel": True,
             "print_preparation_pdf": True,
             "print_timing_pdf": True
@@ -692,29 +691,20 @@ class SettingsDialog(QDialog):
         self.create_prep_excel_checkbox = QCheckBox("فایل اکسل آماده سازی ایجاد شود")
         self.delete_temp_checkbox = QCheckBox("پس از پایان پردازش، فایل‌های موقت پاک شوند")
 
-        # Two aligned columns keep the four processing options visually organized.
+        # Keep the two-column options grid grouped and aligned to the right.
         checkboxes_layout = QGridLayout()
-        checkboxes_layout.setHorizontalSpacing(24)
-        checkboxes_layout.setVerticalSpacing(8)
-        checkboxes_layout.setColumnStretch(0, 1)
-        checkboxes_layout.setColumnStretch(1, 1)
+        checkboxes_layout.setHorizontalSpacing(28)
+        checkboxes_layout.setVerticalSpacing(10)
         checkbox_alignment = Qt.AlignRight | Qt.AlignVCenter
         checkboxes_layout.addWidget(self.print_prep_pdf_checkbox, 0, 0, alignment=checkbox_alignment)
         checkboxes_layout.addWidget(self.print_timing_pdf_checkbox, 0, 1, alignment=checkbox_alignment)
         checkboxes_layout.addWidget(self.create_prep_excel_checkbox, 1, 0, alignment=checkbox_alignment)
         checkboxes_layout.addWidget(self.delete_temp_checkbox, 1, 1, alignment=checkbox_alignment)
 
-        op_layout = QHBoxLayout()
-        op_label = QLabel("عملیات انتقال فایل اصلی سفارش:")
-        self.copy_radio = QRadioButton("Copy")
-        self.cut_radio = QRadioButton("Cut")
-        op_layout.addWidget(op_label)
-        op_layout.addWidget(self.copy_radio)
-        op_layout.addWidget(self.cut_radio)
-        op_layout.addStretch()
-
-        options_layout.addLayout(checkboxes_layout)
-        options_layout.addLayout(op_layout)
+        options_row = QHBoxLayout()
+        options_row.addStretch(1)
+        options_row.addLayout(checkboxes_layout)
+        options_layout.addLayout(options_row)
         options_group.setLayout(options_layout)
         self.layout.addWidget(options_group)
 
@@ -785,10 +775,6 @@ class SettingsDialog(QDialog):
         self.create_prep_excel_checkbox.setChecked(settings.get("create_preparation_excel", True))
         self.delete_temp_checkbox.setChecked(settings.get("delete_temp_files", True))
         
-        if settings.get("file_operation", "copy") == "cut":
-            self.cut_radio.setChecked(True)
-        else:
-            self.copy_radio.setChecked(True)
 
     def _connect_signals(self):
         """ Connects widget signals to their respective slots. """
@@ -818,7 +804,6 @@ class SettingsDialog(QDialog):
         self.config_manager.settings["print_timing_pdf"] = self.print_timing_pdf_checkbox.isChecked()
         self.config_manager.settings["create_preparation_excel"] = self.create_prep_excel_checkbox.isChecked()
         self.config_manager.settings["delete_temp_files"] = self.delete_temp_checkbox.isChecked()
-        self.config_manager.settings["file_operation"] = "cut" if self.cut_radio.isChecked() else "copy"
         
         self.config_manager.save()
 
