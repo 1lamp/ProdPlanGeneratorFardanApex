@@ -15,20 +15,24 @@ import sys
 import json
 import shutil
 
+import keyring
+
 from erp_repository import ErpRepository
-from order_sheet_pdf import create_order_sheet_pdf
+from order_sheet_pdf import create_order_sheet_pdf, merged_pdf_filename
 
 # === Third-Party Libraries ===
 import pandas as pd
 import xlwings as xw
 from PyPDF2 import PdfWriter
-from PyQt5.QtCore import QObject, QThread, pyqtSignal, Qt, QTimer
-from PyQt5.QtGui import QFont, QIcon, QPixmap, QFontDatabase
+from PyQt5.QtCore import QObject, QThread, pyqtSignal, Qt, QTimer, QPointF, QRectF
+from PyQt5.QtGui import (
+    QFont, QIcon, QPixmap, QFontDatabase, QPainter, QPainterPath, QColor, QPolygonF
+)
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QTextEdit, QLabel, QMessageBox, QSplashScreen, QProgressBar, QStyle,
     QGroupBox, QDialog, QLineEdit, QFileDialog, QCheckBox, QRadioButton,
-    QListWidget, QListWidgetItem
+    QListWidget, QListWidgetItem, QComboBox, QGridLayout
 )
 
 # ==============================================================================
@@ -74,7 +78,6 @@ class ConfigManager:
             "sql_database": "FARDAN_OLTP",
             "sql_driver": "ODBC Driver 18 for SQL Server",
             "delete_temp_files": True,
-            "file_operation": "copy",
             "create_preparation_excel": True,
             "print_preparation_pdf": True,
             "print_timing_pdf": True
@@ -91,7 +94,7 @@ ORDER_SHEET_NAME = "OrderList"
 DATABASE_SHEET_NAME = "LOM"
 COL_ORDER_NUM = "شماره سفارش"
 COL_PRODUCT_CODE = "کد محصول"
-COL_QUANTITY = " تعداد"
+COL_QUANTITY = "تعداد"
 
 # --- Input Cells in LOM Sheet ---
 CELL_PRODUCT_CODE = "I4"
@@ -167,11 +170,66 @@ class DirectoryScannerWorker(QObject):
         self.finished.emit()
 
 # ==============================================================================
+# Animated "busy" bar (striped, no percentage)
+# ==============================================================================
+class StripedProgressBar(QWidget):
+    """A full bar whose diagonal stripes keep moving, so the user can see the app is working."""
+    BAR_COLOR = "#2e7dff"      # bar color
+    STRIPE_WIDTH = 14          # width of each light stripe (px)
+    INTERVAL_MS = 30           # animation speed: lower = faster
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(16)
+        self._offset = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.INTERVAL_MS)
+        self._timer.timeout.connect(self._advance)
+        self.hide()
+
+    def start(self):
+        self._offset = 0
+        self._timer.start()
+        self.show()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def _advance(self):
+        self._offset = (self._offset + 1) % (self.STRIPE_WIDTH * 2)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = rect.height() / 2
+        path = QPainterPath()
+        path.addRoundedRect(rect, radius, radius)
+        painter.setClipPath(path)
+        painter.fillPath(path, QColor(self.BAR_COLOR))
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 80))
+        height = rect.height()
+        stripe = self.STRIPE_WIDTH
+        step = stripe * 2
+        x = -height - step + self._offset
+        while x < self.width():
+            painter.drawPolygon(QPolygonF([
+                QPointF(x, height), QPointF(x + stripe, height),
+                QPointF(x + stripe + height, 0), QPointF(x + height, 0),
+            ]))
+            x += step
+
+# ==============================================================================
 # Core Application Logic (Worker Thread)
 # ==============================================================================
 class Worker(QObject):
     """ Handles the core data processing in a separate thread. """
     status_update = pyqtSignal(str)
+    busy_changed = pyqtSignal(bool)   # True: show the animated bar, False: hide it
     finished = pyqtSignal()
     error_signal = pyqtSignal(str, str)
     warning_signal = pyqtSignal(str, str)
@@ -402,6 +460,7 @@ class Worker(QObject):
             self.status_update.emit(
                 "   🌀 شروع پردازش اکسل دیتابیس محصولات و چاپ برگه‌ها . . .\n"
             )
+            self.busy_changed.emit(True)   # animated bar appears right after the message above
             with xw.App(visible=False) as app:
                 self.db_wb = app.books.open(database_file_path, read_only=True)
                 db_sheet = self.db_wb.sheets[DATABASE_SHEET_NAME]
@@ -506,7 +565,7 @@ class Worker(QObject):
                     
                     final_main_pdf_path = None
                     if len(main_merger.pages) > 0:
-                        final_main_pdf_path = os.path.join(order_folder, f"{order_num_str}.pdf")
+                        final_main_pdf_path = os.path.join(order_folder, merged_pdf_filename(order_metadata, order_num_str))
                         with open(final_main_pdf_path, "wb") as f: main_merger.write(f)
                         self.status_update.emit(f"  ✔ فایل اصلی ادغام شده برای سفارش {order_num_str} ذخیره شد.\n")
 
@@ -578,9 +637,19 @@ class Worker(QObject):
             self.status_update.emit(
                 f"خطای بحرانی: {e}\n"
             )
+
         finally:
-            if self.db_wb:
-                self.db_wb.close()
+            if self.db_wb is not None:
+                try:
+                    self.db_wb.close()
+                except Exception as close_error:
+                    self.status_update.emit(
+                        f"هشدار: بستن فایل Excel ناموفق بود: {close_error}\n"
+                    )
+                finally:
+                    self.db_wb = None
+
+            self.busy_changed.emit(False)
             self.finished.emit()
 
 # ==============================================================================
@@ -609,28 +678,66 @@ class SettingsDialog(QDialog):
         paths_group.setLayout(paths_layout)
         self.layout.addWidget(paths_group)
 
+        sql_group = QGroupBox("اتصال به پایگاه داده ERP")
+        sql_layout = QVBoxLayout()
+        self.sql_server_input = QLineEdit()
+        self.sql_server_input.setPlaceholderText("مثال: localhost یا 192.168.1.10,1433 یا SERVER\\INSTANCE")
+        self.sql_database_input = QLineEdit()
+        self.sql_database_input.setPlaceholderText("نام پایگاه داده")
+        self.sql_driver_input = QLineEdit()
+        self.sql_driver_input.setPlaceholderText("نام درایور ODBC نصب‌شده")
+        self.sql_auth_combo = QComboBox()
+        self.sql_auth_combo.addItem("احراز هویت ویندوز (Windows Authentication)", "windows")
+        self.sql_auth_combo.addItem("نام کاربری و رمز SQL Server", "sql")
+        self.sql_username_input = QLineEdit()
+        self.sql_username_input.setPlaceholderText("نام کاربری SQL؛ برای ویندوز خالی بماند")
+        self.sql_password_input = QLineEdit()
+        self.sql_password_input.setEchoMode(QLineEdit.Password)
+        self.sql_password_input.setPlaceholderText("برای تغییر رمز وارد کنید؛ خالی = استفاده از رمز ذخیره‌شده")
+        self.sql_password_input.setToolTip("رمز در Windows Credential Manager ذخیره می‌شود، نه در config.json.")
+
+        def add_sql_row(label_text, widget):
+            row = QHBoxLayout()
+            label = QLabel(label_text)
+            label.setFixedWidth(150)
+            row.addWidget(label)
+            row.addWidget(widget, 1)
+            sql_layout.addLayout(row)
+
+        add_sql_row("آدرس سرور:", self.sql_server_input)
+        add_sql_row("نام پایگاه داده:", self.sql_database_input)
+        add_sql_row("درایور ODBC:", self.sql_driver_input)
+        add_sql_row("روش ورود:", self.sql_auth_combo)
+        add_sql_row("نام کاربری:", self.sql_username_input)
+        add_sql_row("رمز عبور:", self.sql_password_input)
+        sql_buttons = QHBoxLayout()
+        self.test_sql_button = QPushButton("آزمایش اتصال")
+        self.test_sql_button.setObjectName("actionButton")
+        self.test_sql_button.clicked.connect(self._test_sql_connection)
+        sql_buttons.addWidget(self.test_sql_button)
+        sql_buttons.addStretch()
+        sql_layout.addLayout(sql_buttons)
+        sql_group.setLayout(sql_layout)
+        self.layout.addWidget(sql_group)
+
         options_group = QGroupBox("گزینه‌های پردازش")
-        options_layout = QVBoxLayout()
+        options_layout = QGridLayout()
         
         self.print_prep_pdf_checkbox = QCheckBox("آماده‌سازی چاپ شود PDF فایل")
         self.print_timing_pdf_checkbox = QCheckBox("زمانسنجی چاپ شود PDF فایل")
         self.create_prep_excel_checkbox = QCheckBox("فایل اکسل آماده‌سازی ایجاد شود")
         self.delete_temp_checkbox = QCheckBox("پس از پایان پردازش، فایل‌های موقت پاک شوند")
         
-        op_layout = QHBoxLayout()
-        op_label = QLabel("عملیات انتقال فایل اصلی سفارش:")
-        self.copy_radio = QRadioButton("Copy")
-        self.cut_radio = QRadioButton("Cut")
-        op_layout.addWidget(op_label)
-        op_layout.addWidget(self.copy_radio)
-        op_layout.addWidget(self.cut_radio)
-        op_layout.addStretch()
-
-        options_layout.addWidget(self.print_prep_pdf_checkbox)
-        options_layout.addWidget(self.print_timing_pdf_checkbox)
-        options_layout.addWidget(self.create_prep_excel_checkbox)
-        options_layout.addWidget(self.delete_temp_checkbox)
-        options_layout.addLayout(op_layout)
+        # Two rows x two columns (the dialog is right-to-left, so column 0 is on the right).
+        # Equal column stretch keeps every checkbox aligned under the one above it.
+        options_layout.addWidget(self.print_prep_pdf_checkbox, 0, 0)
+        options_layout.addWidget(self.print_timing_pdf_checkbox, 0, 1)
+        options_layout.addWidget(self.create_prep_excel_checkbox, 1, 0)
+        options_layout.addWidget(self.delete_temp_checkbox, 1, 1)
+        options_layout.setColumnStretch(0, 1)
+        options_layout.setColumnStretch(1, 1)
+        options_layout.setHorizontalSpacing(24)
+        options_layout.setVerticalSpacing(12)
         options_group.setLayout(options_layout)
         self.layout.addWidget(options_group)
 
@@ -688,15 +795,18 @@ class SettingsDialog(QDialog):
         for key, widget_tuple in self.path_widgets.items():
             widget_tuple[1].setText(settings.get(key, ""))
         
+        self.sql_server_input.setText(settings.get("sql_server", "localhost"))
+        self.sql_database_input.setText(settings.get("sql_database", "FARDAN_OLTP"))
+        self.sql_driver_input.setText(settings.get("sql_driver", "ODBC Driver 18 for SQL Server"))
+        auth_index = self.sql_auth_combo.findData(settings.get("sql_authentication", "windows"))
+        self.sql_auth_combo.setCurrentIndex(max(auth_index, 0))
+        self.sql_username_input.setText(settings.get("sql_username", ""))
+        self.sql_password_input.clear()
+
         self.print_prep_pdf_checkbox.setChecked(settings.get("print_preparation_pdf", True))
         self.print_timing_pdf_checkbox.setChecked(settings.get("print_timing_pdf", True))
         self.create_prep_excel_checkbox.setChecked(settings.get("create_preparation_excel", True))
         self.delete_temp_checkbox.setChecked(settings.get("delete_temp_files", True))
-        
-        if settings.get("file_operation", "copy") == "cut":
-            self.cut_radio.setChecked(True)
-        else:
-            self.copy_radio.setChecked(True)
 
     def _connect_signals(self):
         """ Connects widget signals to their respective slots. """
@@ -708,17 +818,59 @@ class SettingsDialog(QDialog):
         for key, widget_tuple in self.path_widgets.items():
             self.config_manager.settings[key] = widget_tuple[1].text()
         
-        self.config_manager.settings["print_preparation_pdf"] = self.print_prep_pdf_checkbox.isChecked()
+        settings = self.config_manager.settings
+        settings["sql_server"] = self.sql_server_input.text().strip()
+        settings["sql_database"] = self.sql_database_input.text().strip()
+        settings["sql_driver"] = self.sql_driver_input.text().strip()
+        settings["sql_authentication"] = self.sql_auth_combo.currentData()
+        settings["sql_username"] = self.sql_username_input.text().strip() if settings["sql_authentication"] == "sql" else ""
+        entered_password = self.sql_password_input.text()
+        if entered_password and settings["sql_authentication"] == "sql":
+            keyring.set_password(
+                ErpRepository.credential_service(settings),
+                settings["sql_username"],
+                entered_password,
+            )
+
+        settings["print_preparation_pdf"] = self.print_prep_pdf_checkbox.isChecked()
         self.config_manager.settings["print_timing_pdf"] = self.print_timing_pdf_checkbox.isChecked()
         self.config_manager.settings["create_preparation_excel"] = self.create_prep_excel_checkbox.isChecked()
         self.config_manager.settings["delete_temp_files"] = self.delete_temp_checkbox.isChecked()
-        self.config_manager.settings["file_operation"] = "cut" if self.cut_radio.isChecked() else "copy"
         
         self.config_manager.save()
 
+    def _test_sql_connection(self):
+        """Validate the currently entered SQL settings without saving them."""
+        settings = dict(self.config_manager.settings)
+        settings.update({
+            "sql_server": self.sql_server_input.text().strip(),
+            "sql_database": self.sql_database_input.text().strip(),
+            "sql_driver": self.sql_driver_input.text().strip(),
+            "sql_authentication": self.sql_auth_combo.currentData(),
+            "sql_username": self.sql_username_input.text().strip() if self.sql_auth_combo.currentData() == "sql" else "",
+        })
+        try:
+            ErpRepository(settings).test_connection(password_override=self.sql_password_input.text() or None)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "اتصال ناموفق",
+                "اتصال به SQL Server برقرار نشد. آدرس، پورت، نام دیتابیس، درایور و مجوز ورود را بررسی کنید.\\n\\n"
+                f"جزئیات: {exc}",
+            )
+            return
+        QMessageBox.information(self, "اتصال موفق", "اتصال به پایگاه داده با موفقیت آزمایش شد.")
+
     def accept(self):
-        """ Overrides the default accept to save settings before closing. """
-        self._save_settings()
+        """Save settings and keep credentials out of the JSON configuration."""
+        try:
+            self._save_settings()
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "ذخیره تنظیمات ناموفق",
+                "تنظیمات ذخیره نشد. امکان ذخیره امن رمز در Windows Credential Manager وجود نداشت.\\n\\n"
+                f"جزئیات: {exc}",
+            )
+            return
         QMessageBox.information(self, "ذخیره شد", "تنظیمات با موفقیت ذخیره شد.")
         super().accept()
 
@@ -741,7 +893,7 @@ class SettingsDialog(QDialog):
             "<h4>Order PDF Generator Application</h4><br>"
             "Automates the generation of production order documents "
             "from Excel data into consolidated PDFs.<br>"
-            "Version: 2.6.19 — © 2025 All Rights Reserved<br>"
+            "Version: 2.6.37 — © 2026 All Rights Reserved<br>"
             "Developed exclusively for:<br>"
             "Garma Gostar Fardan Co."
         )
@@ -808,7 +960,7 @@ class ProdPlanApp(QWidget):
         """ Initializes the UI components. """
         self.setWindowTitle("سازنده برگه‌های سفارش - ProdPlanGenerator - FardanApex")
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
-        self.setGeometry(250, 100, 900, 600)
+        self.resize(900, 600)   # final size/position: see fit_to_screen()
 
         main_layout = QVBoxLayout(self)
         top_layout = QHBoxLayout()
@@ -858,7 +1010,9 @@ class ProdPlanApp(QWidget):
         processing_status_layout = QVBoxLayout()
         self.status_box = QTextEdit()
         self.status_box.setReadOnly(True)
+        self.busy_bar = StripedProgressBar()
         processing_status_layout.addWidget(self.status_box)
+        processing_status_layout.addWidget(self.busy_bar)
         processing_status_group_box.setLayout(processing_status_layout)
         right_pane_layout.addWidget(processing_status_group_box)
         
@@ -984,11 +1138,32 @@ class ProdPlanApp(QWidget):
         self.worker.error_signal.connect(self.show_error_message)
         self.worker.warning_signal.connect(self.show_warning_message)
         self.worker.info_signal.connect(self.show_info_message)
+        self.worker.busy_changed.connect(self.set_busy)
         
+        self.thread.finished.connect(self.busy_bar.stop)
         self.thread.finished.connect(lambda: self.process_button.setDisabled(False))
         self.thread.finished.connect(lambda: self.settings_button.setDisabled(False))
         
         self.thread.start()
+
+    def set_busy(self, busy):
+        """ Shows/hides the animated bar under the status report. """
+        if busy:
+            self.busy_bar.start()
+        else:
+            self.busy_bar.stop()
+
+    def fit_to_screen(self, height_ratio=0.7):
+        """ Window height = 70% of the usable screen height (taskbar excluded), centered. """
+        screen = self.screen() if hasattr(self, "screen") else QApplication.primaryScreen()
+        available = screen.availableGeometry()
+        frame_h = self.frameGeometry().height() - self.geometry().height()   # title bar + borders
+        frame_w = self.frameGeometry().width() - self.geometry().width()
+        total_h = int(available.height() * height_ratio)
+        total_w = min(self.width() + frame_w, available.width())
+        self.resize(total_w - frame_w, total_h - frame_h)
+        self.move(available.x() + (available.width() - total_w) // 2,
+                  available.y() + (available.height() - total_h) // 2)
 
     def update_status(self, message):
         """ Appends a message to the status box. """
@@ -1059,6 +1234,7 @@ def main():
             timer.stop()
             splash.close()
             main_window.show()
+            main_window.fit_to_screen()
 
     timer = QTimer()
     timer.timeout.connect(update_progress)
@@ -1068,5 +1244,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

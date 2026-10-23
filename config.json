@@ -1,11 +1,14 @@
 {
-    "database_file_path": "\\\\fileserver\\Mohandesi\\Database\\Database.xlsm",
-    "output_base_path": "\\\\fileserver\\general\\public\\برنامه ریزی\\سفارشات",
-    "sql_server": "",
+    "database_file_path": "D:\\MyWork\\G.G.Fardan\\row\\Database.xlsm",
+    "output_base_path": "C:\\Users\\BenRabin\\Documents\\GitHub\\ProdPlanGeneratorFardanApex\\export",
+    "sql_server": "BEHNAM-VAIO",
     "sql_database": "FARDAN_OLTP",
     "sql_driver": "ODBC Driver 18 for SQL Server",
-    "delete_temp_files": true,
+    "delete_temp_files": false,
     "create_preparation_excel": true,
-    "print_preparation_pdf": false,
-    "print_timing_pdf": true
+    "print_preparation_pdf": true,
+    "print_timing_pdf": true,
+    "sql_authentication": "sql",
+    "sql_username": "benadmin",
+    "file_operation": "copy"
 }
