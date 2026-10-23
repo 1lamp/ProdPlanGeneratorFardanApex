@@ -114,6 +114,32 @@ class ErpRepository:
             columns = [column[0] for column in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()], bool(timestamp_column)
 
+    @staticmethod
+    def _attach_prepared_by(cursor, orders):
+        """Best effort: full name of the user who registered each order.
+
+        Kept in its own try/except so a missing SELECT permission on the security/hr
+        schemas can never break order processing; the sheet then simply omits the name.
+        """
+        order_ids = [order["order_id"] for order in orders.values()]
+        names = {}
+        if order_ids:
+            try:
+                placeholders = ",".join("?" for _ in order_ids)
+                cursor.execute(f"""
+                    SELECT o.order_id, e.first_name, e.last_name
+                    FROM sales.orders o
+                    INNER JOIN security.users u ON u.user_id = o.created_by
+                    INNER JOIN hr.employees e ON e.employee_id = u.employee_id
+                    WHERE o.order_id IN ({placeholders})
+                """, order_ids)
+                for order_id, first_name, last_name in cursor.fetchall():
+                    names[order_id] = f"{first_name or ''} {last_name or ''}".strip()
+            except Exception:
+                names = {}
+        for order in orders.values():
+            order["prepared_by"] = names.get(order["order_id"], "")
+
     def get_orders_for_processing(self, order_numbers):
         """Fetch order headers and line details for manually entered or listed orders."""
         if not order_numbers:
@@ -164,4 +190,5 @@ class ErpRepository:
                     "item_notes": item["proforma_item_notes"] or item["item_notes"],
                     "delivery_time": item["item_delivery_time"],
                 })
+            self._attach_prepared_by(cursor, result)
             return result
