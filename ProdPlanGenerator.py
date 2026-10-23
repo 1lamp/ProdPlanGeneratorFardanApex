@@ -93,7 +93,7 @@ ORDER_SHEET_NAME = "OrderList"
 DATABASE_SHEET_NAME = "LOM"
 COL_ORDER_NUM = "شماره سفارش"
 COL_PRODUCT_CODE = "کد محصول"
-COL_QUANTITY = " تعداد"
+COL_QUANTITY = "تعداد"
 
 # --- Input Cells in LOM Sheet ---
 CELL_PRODUCT_CODE = "I4"
@@ -373,8 +373,12 @@ class Worker(QObject):
                 self.finished.emit()
                 return
 
-            order_numbers_list = [num.strip() for num in self.order_numbers_str.strip().split('\n') if num.strip()]
-            if not order_numbers_list:
+            # The UI accepts/displays only the numeric part, while ERP stores ORD-<number>.
+            entered_order_numbers = [
+                re.sub(r"^ORD-", "", num.strip(), flags=re.IGNORECASE)
+                for num in self.order_numbers_str.strip().split('\n') if num.strip()
+            ]
+            if not entered_order_numbers:
                 self.error_signal.emit(
                     "ورودی خالی", 
                     "هیچ شماره سفارشی برای پردازش وارد نشده است."
@@ -382,21 +386,32 @@ class Worker(QObject):
                 self.finished.emit()
                 return
 
+            # Avoid double-prefixing if a user pastes a number in ORD-<number> format.
+            order_numbers_list = [f"ORD-{number}" for number in entered_order_numbers]
             self.status_update.emit(
-                f"شماره‌های سفارش برای پردازش:\n{order_numbers_list}\n"
+                f"شماره‌های سفارش برای پردازش:\n{entered_order_numbers}\n"
             )
             self.status_update.emit("⏳ در حال دریافت سفارش‌ها از ERP (فقط‌خواندنی) . . .\n")
-            erp_orders = ErpRepository(self.config).get_orders_for_processing(order_numbers_list)
-            if not erp_orders:
+            erp_orders_raw = ErpRepository(self.config).get_orders_for_processing(order_numbers_list)
+            if not erp_orders_raw:
                 self.warning_signal.emit("یافت نشد", "برای شماره‌های واردشده، سفارش فعالی در ERP یافت نشد.")
                 self.finished.emit()
                 return
+
+            # Use numeric order numbers throughout the app after retrieving matching ORD-<number> records.
+            erp_orders = {}
+            for stored_order_number, order in erp_orders_raw.items():
+                numeric_order_number = re.sub(r"^ORD-", "", str(stored_order_number).strip(), flags=re.IGNORECASE)
+                erp_orders[numeric_order_number] = order
+                if isinstance(order, dict) and "order_number" in order:
+                    order["order_number"] = numeric_order_number
+
             rows = []
             for order_number, order in erp_orders.items():
                 for item in order["items"]:
                     rows.append({COL_ORDER_NUM: order_number, COL_PRODUCT_CODE: item.get("technical_code") or "", COL_QUANTITY: item.get("quantity") or 0})
             filtered_df = pd.DataFrame(rows)
-            missing_orders = [number for number in order_numbers_list if number not in erp_orders]
+            missing_orders = [number for number in entered_order_numbers if number not in erp_orders]
             if missing_orders:
                 self.status_update.emit(f"⚠️ سفارش‌های فعال یافت‌نشده: {', '.join(missing_orders)}\n")
             self.status_update.emit(f"🔎 تعداد {len(filtered_df)} قلم از ERP دریافت شد.\n")
@@ -554,8 +569,16 @@ class Worker(QObject):
                             f"    ✔ {deleted_count} فایل موقت با موفقیت حذف شد.\n"
                         )
                 
-                self.db_wb.close()
-                self.db_wb = None
+                # Close the workbook defensively. Excel may already have exited,
+                # in which case xlwings can raise an RPC error during cleanup.
+                try:
+                    self.db_wb.close()
+                except Exception as close_error:
+                    self.status_update.emit(
+                        f"⚠️ بستن فایل اکسل دیتابیس با خطا مواجه شد: {close_error}\n"
+                    )
+                finally:
+                    self.db_wb = None
                 self.status_update.emit(
                     "\n💯 عملیات پردازش با موفقیت به پایان رسید.\n"
                 )
@@ -581,8 +604,16 @@ class Worker(QObject):
                 f"خطای بحرانی: {e}\n"
             )
         finally:
+            # Never let a cleanup failure mask the original processing exception.
             if self.db_wb:
-                self.db_wb.close()
+                workbook = self.db_wb
+                self.db_wb = None
+                try:
+                    workbook.close()
+                except Exception as close_error:
+                    self.status_update.emit(
+                        f"⚠️ هنگام بستن فایل اکسل دیتابیس خطا رخ داد: {close_error}\n"
+                    )
             self.finished.emit()
 
 # ==============================================================================
@@ -988,14 +1019,15 @@ class ProdPlanApp(QWidget):
             orders, has_serial_timestamp = ErpRepository(CONFIG.settings).list_ready_orders()
             for order in orders:
                 order_number = str(order.get("order_number", "")).strip()
+                display_order_number = re.sub(r"^ORD-", "", order_number, flags=re.IGNORECASE)
                 order_date = order.get("order_date")
                 serial_date = order.get("serial_approved_at")
                 order_date_text = order_date.strftime("%Y-%m-%d") if hasattr(order_date, "strftime") else str(order_date or "-")
                 serial_date_text = serial_date.strftime("%Y-%m-%d %H:%M") if hasattr(serial_date, "strftime") else "نامشخص"
                 company = order.get("company_name") or ""
-                label = f"{order_number} | سفارش: {order_date_text} | تأیید سریال: {serial_date_text} | {company} | اقلام: {order.get('item_count', 0)}"
+                label = f"{display_order_number} | سفارش: {order_date_text} | تأیید سریال: {serial_date_text} | {company} | اقلام: {order.get('item_count', 0)}"
                 item = QListWidgetItem(label)
-                item.setData(Qt.UserRole, order_number)
+                item.setData(Qt.UserRole, display_order_number)
                 self.ready_orders_list.addItem(item)
             if not has_serial_timestamp:
                 self.confirmed_orders_label.setText("⚠️ در شِمای فعلی ERP تاریخ ایجاد سریال وجود ندارد؛ تاریخ تأیید نمایش‌داده نمی‌شود.")
@@ -1163,4 +1195,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
