@@ -483,7 +483,7 @@ class Worker(QObject):
             self.status_update.emit(
                 f"شماره‌های سفارش برای پردازش:\n{entered_order_numbers}\n"
             )
-            self.status_update.emit("⏳ در حال دریافت سفارش‌ها از ERP (فقط‌خواندنی) . . .\n")
+            self.status_update.emit("⏳ در حال دریافت سفارش‌ها از ERP . . .\n")
             erp_orders_raw = ErpRepository(self.config).get_orders_for_processing(order_numbers_list)
             if not erp_orders_raw:
                 self.warning_signal.emit("یافت نشد", "برای شماره‌های واردشده، سفارش فعالی در ERP یافت نشد.")
@@ -664,6 +664,19 @@ class Worker(QObject):
                         self.status_update.emit(
                             f"    ✔ {deleted_count} فایل موقت با موفقیت حذف شد.\n"
                         )
+
+                    # Mark the order only after the final merged production PDF was written.
+                    # Manually entered order numbers are still processed regardless of this flag.
+                    if final_main_pdf_path and os.path.isfile(final_main_pdf_path):
+                        try:
+                            ErpRepository(self.config).mark_production_sheet_prepared(f"ORD-{order_num_str}")
+                            self.status_update.emit(
+                                f"✔ وضعیت برگه تولید سفارش {order_num_str} در ERP ثبت شد.\n"
+                            )
+                        except Exception as status_error:
+                            self.status_update.emit(
+                                f"✘ فایل خروجی ساخته شد، اما ثبت وضعیت برگه تولید در ERP ناموفق بود: {status_error}\n"
+                            )
 
                     processed_orders += 1
                     self.progress_changed.emit(processed_orders, total_orders)
