@@ -125,6 +125,17 @@ def _format_date(value):
     return _clean(value)
 
 
+def jalali_date_text(value, persian_digits=False):
+    """ Gregorian date/datetime -> Jalali 'YYYY/MM/DD' (Latin digits unless persian_digits=True). """
+    if isinstance(value, datetime):
+        value = value.date()
+    if not isinstance(value, date):
+        return _clean(value)
+    jy, jm, jd = _to_jalali(value.year, value.month, value.day)
+    text = f"{jy:04d}/{jm:02d}/{jd:02d}"
+    return text.translate(_PERSIAN_DIGITS) if persian_digits else text
+
+
 def _format_quantity(value):
     if value is None:
         return ""
@@ -141,14 +152,14 @@ def _join_notes(*values):
 
 
 def merged_pdf_filename(order, fallback_number=""):
-    """Final merged file name: '(5370) استیل البرز.pdf' (order number without 'ORD', one space, customer)."""
+    """Final merged file name: 'استیل البرز (5370).pdf' (customer, one space, order number in parentheses)."""
     order = order or {}
     number = _clean(order.get("order_number")) or _clean(fallback_number)
     digits = re.findall(r"\d+", number)
     number = digits[-1] if digits else number
     company = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", _clean(order.get("company_name")))
     company = re.sub(r"\s+", " ", company).strip(" .")
-    return (f"({number}) {company}" if company else f"({number})") + ".pdf"
+    return (f"{company} ({number})" if company else f"({number})") + ".pdf"
 
 
 # ------------------------------------------------------------------------------

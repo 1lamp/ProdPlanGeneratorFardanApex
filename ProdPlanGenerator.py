@@ -13,12 +13,14 @@ import os
 import re
 import sys
 import json
+import time
 import shutil
+import html as html_lib
 
 import keyring
 
 from erp_repository import ErpRepository
-from order_sheet_pdf import create_order_sheet_pdf, merged_pdf_filename
+from order_sheet_pdf import create_order_sheet_pdf, merged_pdf_filename, jalali_date_text
 
 # === Third-Party Libraries ===
 import pandas as pd
@@ -32,7 +34,8 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QTextEdit, QLabel, QMessageBox, QSplashScreen, QProgressBar, QStyle,
     QGroupBox, QDialog, QLineEdit, QFileDialog, QCheckBox, QRadioButton,
-    QListWidget, QListWidgetItem, QComboBox, QGridLayout
+    QListWidget, QListWidgetItem, QComboBox, QGridLayout, QFrame, QTableWidget,
+    QTableWidgetItem, QHeaderView, QAbstractItemView
 )
 
 # ==============================================================================
@@ -95,6 +98,22 @@ DATABASE_SHEET_NAME = "LOM"
 COL_ORDER_NUM = "شماره سفارش"
 COL_PRODUCT_CODE = "کد محصول"
 COL_QUANTITY = "تعداد"
+
+# ==============================================================================
+# Main window size settings (pixels) - change these numbers to tune the window height
+# ==============================================================================
+# The window opens at the SHORTEST height its boxes allow, so these numbers decide the final height:
+# LOWER them for a shorter window, RAISE them for a taller one. Both boxes scroll when they have
+# more content than fits, so they never make the window taller than this.
+ORDER_TABLE_VISIBLE_ROWS = 4   # rows of the orders table visible before it scrolls
+ORDER_ROW_HEIGHT = 30          # height of one table row (and of the table header)
+LOG_BOX_MIN_HEIGHT = 250       # minimum height of the "گزارش پردازش" box
+WINDOW_DEFAULT_WIDTH = 900    # window width when the program opens
+WINDOW_DEFAULT_HEIGHT = None   # None = shortest possible height; or a number such as 500 to choose it
+                               # (never below the minimum the boxes need, never above the safety limit)
+# Safety limit: the window is never taller than this fraction of the usable screen height
+# (the Windows taskbar is not counted as usable), so it can not slide under the taskbar.
+WINDOW_MAX_HEIGHT_RATIO = 0.85
 
 # --- Input Cells in LOM Sheet ---
 CELL_PRODUCT_CODE = "I4"
@@ -173,55 +192,71 @@ class DirectoryScannerWorker(QObject):
 # Animated "busy" bar (striped, no percentage)
 # ==============================================================================
 class StripedProgressBar(QWidget):
-    """A full bar whose diagonal stripes keep moving, so the user can see the app is working."""
-    BAR_COLOR = "#2e7dff"      # bar color
-    STRIPE_WIDTH = 14          # width of each light stripe (px)
+    """ Progress bar with moving stripes. While busy, the stripes keep moving so the user can see the
+    app is working; the solid part grows with set_progress(0..1) as orders are completed. """
+    BAR_COLOR = "#2e7dff"      # filled part
+    TRACK_COLOR = "#dce6f7"    # empty part
+    STRIPE_WIDTH = 14          # width of each stripe (px)
     INTERVAL_MS = 30           # animation speed: lower = faster
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(16)
+        self.setFixedHeight(12)
         self._offset = 0
+        self._fraction = 0.0
+        self._busy = False
         self._timer = QTimer(self)
         self._timer.setInterval(self.INTERVAL_MS)
         self._timer.timeout.connect(self._advance)
-        self.hide()
+
+    def set_progress(self, fraction):
+        self._fraction = max(0.0, min(1.0, float(fraction)))
+        self.update()
 
     def start(self):
-        self._offset = 0
+        self._busy = True
         self._timer.start()
-        self.show()
+        self.update()
 
     def stop(self):
+        self._busy = False
         self._timer.stop()
-        self.hide()
+        self.update()
 
     def _advance(self):
         self._offset = (self._offset + 1) % (self.STRIPE_WIDTH * 2)
         self.update()
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        radius = rect.height() / 2
-        path = QPainterPath()
-        path.addRoundedRect(rect, radius, radius)
-        painter.setClipPath(path)
-        painter.fillPath(path, QColor(self.BAR_COLOR))
-
+    def _draw_stripes(self, painter, left, right, height, color):
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 80))
-        height = rect.height()
+        painter.setBrush(color)
         stripe = self.STRIPE_WIDTH
         step = stripe * 2
-        x = -height - step + self._offset
-        while x < self.width():
+        x = left - height - step + self._offset
+        while x < right:
             painter.drawPolygon(QPolygonF([
                 QPointF(x, height), QPointF(x + stripe, height),
                 QPointF(x + stripe + height, 0), QPointF(x + height, 0),
             ]))
             x += step
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        height = rect.height()
+        path = QPainterPath()
+        path.addRoundedRect(rect, height / 2, height / 2)
+        painter.setClipPath(path)
+        painter.fillPath(path, QColor(self.TRACK_COLOR))
+        if self._busy:   # faint moving stripes over the whole bar: "still working"
+            self._draw_stripes(painter, 0, self.width(), height, QColor(46, 125, 255, 45))
+        fill_width = rect.width() * self._fraction
+        if fill_width > 0:
+            painter.fillRect(QRectF(rect.left(), rect.top(), fill_width, height), QColor(self.BAR_COLOR))
+            if self._busy:
+                painter.setClipRect(QRectF(rect.left(), rect.top(), fill_width, height))
+                self._draw_stripes(painter, 0, self.width(), height, QColor(255, 255, 255, 80))
 
 # ==============================================================================
 # Core Application Logic (Worker Thread)
@@ -229,7 +264,8 @@ class StripedProgressBar(QWidget):
 class Worker(QObject):
     """ Handles the core data processing in a separate thread. """
     status_update = pyqtSignal(str)
-    busy_changed = pyqtSignal(bool)   # True: show the animated bar, False: hide it
+    busy_changed = pyqtSignal(bool)   # True: stripes moving, False: stopped
+    progress_changed = pyqtSignal(int, int)   # (orders done, orders total)
     finished = pyqtSignal()
     error_signal = pyqtSignal(str, str)
     warning_signal = pyqtSignal(str, str)
@@ -429,8 +465,12 @@ class Worker(QObject):
                 self.finished.emit()
                 return
 
-            order_numbers_list = [num.strip() for num in self.order_numbers_str.strip().split('\n') if num.strip()]
-            if not order_numbers_list:
+            # The UI accepts/displays only the numeric part, while ERP stores ORD-<number>.
+            entered_order_numbers = [
+                re.sub(r"^ORD-", "", num.strip(), flags=re.IGNORECASE)
+                for num in self.order_numbers_str.strip().split('\n') if num.strip()
+            ]
+            if not entered_order_numbers:
                 self.error_signal.emit(
                     "ورودی خالی", 
                     "هیچ شماره سفارشی برای پردازش وارد نشده است."
@@ -438,21 +478,32 @@ class Worker(QObject):
                 self.finished.emit()
                 return
 
+            # Avoid double-prefixing if a user pastes a number in ORD-<number> format.
+            order_numbers_list = [f"ORD-{number}" for number in entered_order_numbers]
             self.status_update.emit(
-                f"شماره‌های سفارش برای پردازش:\n{order_numbers_list}\n"
+                f"شماره‌های سفارش برای پردازش:\n{entered_order_numbers}\n"
             )
             self.status_update.emit("⏳ در حال دریافت سفارش‌ها از ERP (فقط‌خواندنی) . . .\n")
-            erp_orders = ErpRepository(self.config).get_orders_for_processing(order_numbers_list)
-            if not erp_orders:
+            erp_orders_raw = ErpRepository(self.config).get_orders_for_processing(order_numbers_list)
+            if not erp_orders_raw:
                 self.warning_signal.emit("یافت نشد", "برای شماره‌های واردشده، سفارش فعالی در ERP یافت نشد.")
                 self.finished.emit()
                 return
+
+            # Use numeric order numbers throughout the app after retrieving matching ORD-<number> records.
+            erp_orders = {}
+            for stored_order_number, order in erp_orders_raw.items():
+                numeric_order_number = re.sub(r"^ORD-", "", str(stored_order_number).strip(), flags=re.IGNORECASE)
+                erp_orders[numeric_order_number] = order
+                if isinstance(order, dict) and "order_number" in order:
+                    order["order_number"] = numeric_order_number
+
             rows = []
             for order_number, order in erp_orders.items():
                 for item in order["items"]:
                     rows.append({COL_ORDER_NUM: order_number, COL_PRODUCT_CODE: item.get("technical_code") or "", COL_QUANTITY: item.get("quantity") or 0})
             filtered_df = pd.DataFrame(rows)
-            missing_orders = [number for number in order_numbers_list if number not in erp_orders]
+            missing_orders = [number for number in entered_order_numbers if number not in erp_orders]
             if missing_orders:
                 self.status_update.emit(f"⚠️ سفارش‌های فعال یافت‌نشده: {', '.join(missing_orders)}\n")
             self.status_update.emit(f"🔎 تعداد {len(filtered_df)} قلم از ERP دریافت شد.\n")
@@ -460,11 +511,14 @@ class Worker(QObject):
             self.status_update.emit(
                 "   🌀 شروع پردازش اکسل دیتابیس محصولات و چاپ برگه‌ها . . .\n"
             )
-            self.busy_changed.emit(True)   # animated bar appears right after the message above
+            self.busy_changed.emit(True)   # the animated bar appears right after the message above
             with xw.App(visible=False) as app:
                 self.db_wb = app.books.open(database_file_path, read_only=True)
                 db_sheet = self.db_wb.sheets[DATABASE_SHEET_NAME]
 
+                total_orders = int(filtered_df[COL_ORDER_NUM].nunique())
+                processed_orders = 0
+                self.progress_changed.emit(0, total_orders)
                 for order_num, group in filtered_df.groupby(COL_ORDER_NUM.strip()):
                     order_num_str = str(order_num)
                     self.status_update.emit(
@@ -610,9 +664,20 @@ class Worker(QObject):
                         self.status_update.emit(
                             f"    ✔ {deleted_count} فایل موقت با موفقیت حذف شد.\n"
                         )
+
+                    processed_orders += 1
+                    self.progress_changed.emit(processed_orders, total_orders)
                 
-                self.db_wb.close()
-                self.db_wb = None
+                # Close the workbook defensively. Excel may already have exited,
+                # in which case xlwings can raise an RPC error during cleanup.
+                try:
+                    self.db_wb.close()
+                except Exception as close_error:
+                    self.status_update.emit(
+                        f"⚠️ بستن فایل اکسل دیتابیس با خطا مواجه شد: {close_error}\n"
+                    )
+                finally:
+                    self.db_wb = None
                 self.status_update.emit(
                     "\n💯 عملیات پردازش با موفقیت به پایان رسید.\n"
                 )
@@ -637,24 +702,59 @@ class Worker(QObject):
             self.status_update.emit(
                 f"خطای بحرانی: {e}\n"
             )
-
         finally:
-            if self.db_wb is not None:
+            # Never let a cleanup failure mask the original processing exception.
+            if self.db_wb:
+                workbook = self.db_wb
+                self.db_wb = None
                 try:
-                    self.db_wb.close()
+                    workbook.close()
                 except Exception as close_error:
                     self.status_update.emit(
-                        f"هشدار: بستن فایل Excel ناموفق بود: {close_error}\n"
+                        f"⚠️ هنگام بستن فایل اکسل دیتابیس خطا رخ داد: {close_error}\n"
                     )
-                finally:
-                    self.db_wb = None
-
             self.busy_changed.emit(False)
             self.finished.emit()
 
 # ==============================================================================
 # Settings Dialog Window
 # ==============================================================================
+# Style of the settings dialog (the main window has its own, newer style).
+DIALOG_STYLESHEET = """
+            QWidget { background-color: #f5f7fb; }
+            QLabel { font-size: 10pt; color: #333; }
+            QTextEdit { 
+                background-color: white; border: 1px solid #d0d7df; 
+                border-radius: 6px; padding: 6px; font-size: 10pt; 
+            }
+            QGroupBox { 
+                border: 1px solid #d0d7df; border-radius: 6px; 
+                margin-top: 10px; padding: 10px; 
+            }
+            QGroupBox::title { 
+                subcontrol-origin: margin; subcontrol-position: top center; 
+                padding: 0 5px; 
+            }
+            QLabel#confirmedOrders { color: #28a745; font-size: 10pt; }
+            QPushButton { 
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #5aa9ff, stop:1 #2e7dff); 
+                color: white; border: none; padding: 8px 10px; border-radius: 8px; 
+            }
+            QPushButton:hover { 
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #6bb8ff, stop:1 #3b8bff); 
+            }
+            QPushButton#secondary { 
+                background: #eef4ff; color: #1a3b6e; border: 1px solid #d0dbff; 
+            }
+            QPushButton#secondary:hover { background: #e0e9ff; }
+            QPushButton#actionButton { 
+                background-color: #f0f0f0; color: #333; border: 1px solid #ccc; 
+                text-align: Center; padding: 5px; font-size: 9pt; 
+            }
+            QPushButton#actionButton:hover { background-color: #e9e9e9; border-color: #bbb; }
+            QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }
+        """
+
 class SettingsDialog(QDialog):
     """ Dialog window for application settings. """
     def __init__(self, config_manager, parent=None):
@@ -721,23 +821,35 @@ class SettingsDialog(QDialog):
         self.layout.addWidget(sql_group)
 
         options_group = QGroupBox("گزینه‌های پردازش")
-        options_layout = QGridLayout()
+        options_layout = QVBoxLayout()
         
-        self.print_prep_pdf_checkbox = QCheckBox("آماده‌سازی چاپ شود PDF فایل")
-        self.print_timing_pdf_checkbox = QCheckBox("زمانسنجی چاپ شود PDF فایل")
-        self.create_prep_excel_checkbox = QCheckBox("فایل اکسل آماده‌سازی ایجاد شود")
-        self.delete_temp_checkbox = QCheckBox("پس از پایان پردازش، فایل‌های موقت پاک شوند")
-        
-        # Two rows x two columns (the dialog is right-to-left, so column 0 is on the right).
-        # Equal column stretch keeps every checkbox aligned under the one above it.
-        options_layout.addWidget(self.print_prep_pdf_checkbox, 0, 0)
-        options_layout.addWidget(self.print_timing_pdf_checkbox, 0, 1)
-        options_layout.addWidget(self.create_prep_excel_checkbox, 1, 0)
-        options_layout.addWidget(self.delete_temp_checkbox, 1, 1)
-        options_layout.setColumnStretch(0, 1)
-        options_layout.setColumnStretch(1, 1)
-        options_layout.setHorizontalSpacing(24)
-        options_layout.setVerticalSpacing(12)
+        # U+202B ... U+202C force right-to-left reading order, so labels that mix Persian and
+        # English (like "فایل PDF ...") show in the correct word order. Just edit the text inside.
+        def rtl(text):
+            return "\u202b" + text + "\u202c"
+
+        self.print_prep_pdf_checkbox = QCheckBox(rtl("فایل PDF آماده سازی چاپ شود"))
+        self.print_timing_pdf_checkbox = QCheckBox(rtl("فایل PDF زمانسنجی چاپ شود"))
+        self.create_prep_excel_checkbox = QCheckBox(rtl("فایل اکسل آماده سازی ایجاد شود"))
+        self.delete_temp_checkbox = QCheckBox(rtl("پس از پایان پردازش، فایل‌های موقت پاک شوند"))
+
+        # Two rows x two columns, grouped at the RIGHT edge of the box.
+        # This dialog is right-to-left, so: the first item added to a horizontal layout sits on the
+        # right, and Qt.AlignLeading means "start of the line" = the right edge. (Qt.AlignRight would
+        # be mirrored to the left in an RTL layout.) That is why the grid is added BEFORE the stretch.
+        checkboxes_layout = QGridLayout()
+        checkboxes_layout.setHorizontalSpacing(28)
+        checkboxes_layout.setVerticalSpacing(10)
+        checkbox_alignment = Qt.AlignLeading | Qt.AlignVCenter
+        checkboxes_layout.addWidget(self.print_prep_pdf_checkbox, 0, 0, alignment=checkbox_alignment)
+        checkboxes_layout.addWidget(self.print_timing_pdf_checkbox, 0, 1, alignment=checkbox_alignment)
+        checkboxes_layout.addWidget(self.create_prep_excel_checkbox, 1, 0, alignment=checkbox_alignment)
+        checkboxes_layout.addWidget(self.delete_temp_checkbox, 1, 1, alignment=checkbox_alignment)
+
+        options_row = QHBoxLayout()
+        options_row.addLayout(checkboxes_layout)
+        options_row.addStretch(1)
+        options_layout.addLayout(options_row)
         options_group.setLayout(options_layout)
         self.layout.addWidget(options_group)
 
@@ -753,7 +865,7 @@ class SettingsDialog(QDialog):
 
         self._connect_signals()
         self._populate_fields()
-        self.setStyleSheet(parent.styleSheet())
+        self.setStyleSheet(DIALOG_STYLESHEET)
 
     def _create_path_selector(self, label_text, selection_mode):
         """ Creates a layout for path selection with a label, line edit, and browse button. """
@@ -807,6 +919,7 @@ class SettingsDialog(QDialog):
         self.print_timing_pdf_checkbox.setChecked(settings.get("print_timing_pdf", True))
         self.create_prep_excel_checkbox.setChecked(settings.get("create_preparation_excel", True))
         self.delete_temp_checkbox.setChecked(settings.get("delete_temp_files", True))
+        
 
     def _connect_signals(self):
         """ Connects widget signals to their respective slots. """
@@ -893,7 +1006,7 @@ class SettingsDialog(QDialog):
             "<h4>Order PDF Generator Application</h4><br>"
             "Automates the generation of production order documents "
             "from Excel data into consolidated PDFs.<br>"
-            "Version: 2.6.37 — © 2026 All Rights Reserved<br>"
+            "Version: 2.6.19 — © 2025 All Rights Reserved<br>"
             "Developed exclusively for:<br>"
             "Garma Gostar Fardan Co."
         )
@@ -945,229 +1058,560 @@ class SettingsDialog(QDialog):
 # ==============================================================================
 # Main Application Window
 # ==============================================================================
+# ==============================================================================
+# Main Window (modern card design)
+# ==============================================================================
+_DIGITS_TO_LATIN = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+_DIGITS_TO_PERSIAN = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+_INPUT_SEPARATORS = " ,،;؛\t-"          # typing one of these after a number adds " - "
+
+
+def fa_digits(value):
+    """ 12 -> ۱۲ """
+    return str(value).translate(_DIGITS_TO_PERSIAN)
+
+
 class ProdPlanApp(QWidget):
     """ Main application window (GUI). """
     def __init__(self):
         super().__init__()
         self.worker = None
         self.thread = None
-        self.scanner_worker = None
-        self.scanner_thread = None
-
+        self._syncing = False          # True while the table and the order box update each other
+        self._last_input_text = ""
         self.initUI()
 
+    # --------------------------------------------------------------------------
+    # UI construction
+    # --------------------------------------------------------------------------
     def initUI(self):
         """ Initializes the UI components. """
         self.setWindowTitle("سازنده برگه‌های سفارش - ProdPlanGenerator - FardanApex")
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
-        self.resize(900, 600)   # final size/position: see fit_to_screen()
+        self.resize(WINDOW_DEFAULT_WIDTH, 600)       # the height is set in fit_to_screen()
 
-        main_layout = QVBoxLayout(self)
-        top_layout = QHBoxLayout()
-        bottom_layout = QHBoxLayout()
-        
-        # --- Left Pane ---
-        left_pane_layout = QVBoxLayout()
-        status_group_box = QGroupBox("لیست سفارش‌ها")
-        status_group_box_layout = QVBoxLayout()
-        self.refresh_button = QPushButton("بروزرسانی لیست")
-        self.refresh_button.setObjectName("actionButton")
-        refresh_icon = self.style().standardIcon(QStyle.SP_BrowserReload)
-        self.refresh_button.setIcon(refresh_icon)
-        
-        self.confirmed_title_label = QLabel("سفارش‌های آماده برنامه‌ریزی (تمام اقلام دارای سریال):")
-        self.confirmed_orders_label = QLabel("برای دریافت فهرست، روی بروزرسانی کلیک کنید.")
-        self.confirmed_orders_label.setObjectName("confirmedOrders")
-        self.confirmed_orders_label.setWordWrap(True)
-        self.ready_orders_list = QListWidget()
-        self.ready_orders_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self.add_selected_button = QPushButton("افزودن سفارش‌های انتخاب‌شده به ورودی")
-        self.add_selected_button.setObjectName("actionButton")
-        status_group_box_layout.addWidget(self.confirmed_title_label)
-        status_group_box_layout.addWidget(self.ready_orders_list, 1)
-        status_group_box_layout.addWidget(self.confirmed_orders_label)
-        status_group_box_layout.addWidget(self.add_selected_button)
-        status_group_box_layout.addWidget(self.refresh_button)
-        status_group_box.setLayout(status_group_box_layout)
-        input_group_box = QGroupBox("ورود شماره سفارش‌ها")
-        input_group_box_layout = QVBoxLayout()
-        self.order_input = QTextEdit()
-        self.order_input.setPlaceholderText("هر شماره سفارش در یک خط جدید...")
-        self.process_button = QPushButton("پردازش سفارش‌ها")
-        self.process_button.setObjectName("actionButton")
-        process_icon = self.style().standardIcon(QStyle.SP_DialogApplyButton)
-        self.process_button.setIcon(process_icon)
-        input_group_box_layout.addWidget(self.order_input)
-        input_group_box_layout.addWidget(self.process_button)
-        input_group_box.setLayout(input_group_box_layout)
-        
-        left_pane_layout.addWidget(status_group_box)
-        left_pane_layout.addWidget(input_group_box)
-        
-        # --- Right Pane ---
-        right_pane_layout = QVBoxLayout()
-        processing_status_group_box = QGroupBox("گزارش وضعیت پردازش")
-        processing_status_layout = QVBoxLayout()
-        self.status_box = QTextEdit()
-        self.status_box.setReadOnly(True)
-        self.busy_bar = StripedProgressBar()
-        processing_status_layout.addWidget(self.status_box)
-        processing_status_layout.addWidget(self.busy_bar)
-        processing_status_group_box.setLayout(processing_status_layout)
-        right_pane_layout.addWidget(processing_status_group_box)
-        
-        top_layout.addLayout(right_pane_layout, 65)
-        top_layout.addLayout(left_pane_layout, 35)
-        
-        # --- Bottom Bar ---
-        self.settings_button = QPushButton("تنظیمات 🛠️")
-        self.settings_button.setFixedHeight(45)
-        bottom_layout.addWidget(self.settings_button)
-        bottom_layout.addStretch()
-        
-        # --- Final Layout ---
-        main_layout.addLayout(top_layout)
-        main_layout.addLayout(bottom_layout)
-        self.setLayout(main_layout)
-        
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.content = QWidget()
+        self.content.setObjectName("content")        # the style sheet only targets this container
+        # Right-to-left window: in every row the FIRST widget added sits on the RIGHT.
+        # To flip the whole window back to left-to-right, change this to Qt.LeftToRight.
+        self.content.setLayoutDirection(Qt.RightToLeft)
+        outer.addWidget(self.content)
+
+        root = QVBoxLayout(self.content)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+        body = QHBoxLayout()
+        body.setSpacing(10)
+        body.addWidget(self._build_orders_card(), 5)   # right: ready orders (first = right-most)
+        body.addWidget(self._build_log_card(), 6)      # left:  report + system status
+        root.addLayout(body, 1)
+        root.addWidget(self._build_input_bar())      # bottom row: label, box, process, settings (right to left)
+
         self.process_button.clicked.connect(self.start_processing)
         self.settings_button.clicked.connect(self.show_settings)
         self.refresh_button.clicked.connect(self.scan_order_directory)
-        self.add_selected_button.clicked.connect(self.add_selected_orders)
-        self.ready_orders_list.itemDoubleClicked.connect(lambda _item: self.add_selected_orders())
-        
+        self.clear_log_button.clicked.connect(self.status_box.clear)
+        self.order_search.textChanged.connect(self._filter_orders)
+        self.order_input.textEdited.connect(self._input_edited)
+        self.order_input.editingFinished.connect(self._normalize_input)
+        self.orders_table.itemChanged.connect(self._on_table_item_changed)
+        self.orders_table.cellClicked.connect(self._on_cell_clicked)
+        self.orders_table.horizontalHeader().sectionClicked.connect(self._toggle_all_visible)
+
         self.apply_stylesheet()
 
+    @staticmethod
+    def _make_card(object_name="card"):
+        card = QFrame()
+        card.setObjectName(object_name)
+        return card
+
+    def _build_orders_card(self):
+        card = self._make_card()
+        card.setLayoutDirection(Qt.RightToLeft)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        title = QLabel("سفارش‌های آماده برنامه‌ریزی")
+        title.setObjectName("cardTitle")
+        self.orders_badge = QLabel("۰ سفارش")
+        self.orders_badge.setObjectName("badge")
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(self.orders_badge)
+        layout.addLayout(header)
+
+        search_row = QHBoxLayout()
+        search_row.setSpacing(8)
+        self.refresh_button = QPushButton("⟳  بروزرسانی")
+        self.refresh_button.setObjectName("primary")
+        self.order_search = QLineEdit()
+        self.order_search.setPlaceholderText("جستجوی شماره سفارش یا مشتری...")
+        self.order_search.setClearButtonEnabled(True)
+        search_row.addWidget(self.refresh_button)
+        search_row.addWidget(self.order_search, 1)
+        layout.addLayout(search_row)
+
+        self.orders_table = self._build_orders_table()
+        layout.addWidget(self.orders_table, 1)
+
+        db_card = self._make_card("innerCard")
+        db_layout = QHBoxLayout(db_card)
+        db_layout.setContentsMargins(10, 5, 10, 5)
+        db_title = QLabel("وضعیت سیستم")
+        self.db_status_label = QLabel()
+        db_layout.addWidget(db_title)
+        db_layout.addStretch(1)
+        db_layout.addWidget(self.db_status_label)
+        layout.addWidget(db_card)
+        self._set_db_status("idle")
+        return card
+
+    def _build_orders_table(self):
+        """ Scrollable table of ready orders: it never grows taller than the window gives it. """
+        table = QTableWidget(0, 5)
+        table.setLayoutDirection(Qt.RightToLeft)
+        table.setHorizontalHeaderLabels(["✓", "شماره سفارش", "مشتری", "تاریخ سفارش", "اقلام"])
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(ORDER_ROW_HEIGHT)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.NoSelection)
+        table.setFocusPolicy(Qt.NoFocus)
+        table.setShowGrid(False)
+        table.setWordWrap(False)
+        table.setTextElideMode(Qt.ElideRight)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        header = table.horizontalHeader()
+        header.setFixedHeight(ORDER_ROW_HEIGHT)
+        header.setHighlightSections(False)
+        header.setSectionsClickable(True)            # clicking the "✓" header selects/clears all
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.resizeSection(0, 40)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        # The table is only this tall at minimum (header + N rows); extra window height is added to it.
+        table.setMinimumHeight(ORDER_ROW_HEIGHT * (ORDER_TABLE_VISIBLE_ROWS + 1) + 4)
+        return table
+
+    def _build_log_card(self):
+        card = self._make_card()
+        card.setLayoutDirection(Qt.RightToLeft)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        title = QLabel("گزارش پردازش")
+        title.setObjectName("cardTitle")
+        self.clear_log_button = QPushButton("پاک کردن")
+        self.clear_log_button.setObjectName("secondary")
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(self.clear_log_button)
+        layout.addLayout(header)
+
+        self.status_box = QTextEdit()                  # scrolls inside its own box
+        self.status_box.setObjectName("logBox")
+        self.status_box.setReadOnly(True)
+        self.status_box.setMinimumHeight(LOG_BOX_MIN_HEIGHT)
+        layout.addWidget(self.status_box, 1)
+
+        status_card = self._make_card("innerCard")
+        status_layout = QVBoxLayout(status_card)
+        status_layout.setContentsMargins(10, 6, 10, 8)
+        status_layout.setSpacing(4)
+        top_row = QHBoxLayout()
+        status_title = QLabel("وضعیت کلی سیستم")
+        status_title.setObjectName("boldLabel")
+        self.state_label = QLabel()
+        self.progress_text_label = QLabel()
+        self.progress_text_label.setObjectName("muted")
+        top_row.addWidget(status_title)
+        top_row.addWidget(self.state_label)
+        top_row.addStretch(1)
+        top_row.addWidget(self.progress_text_label)
+        self.busy_bar = StripedProgressBar()
+        status_layout.addLayout(top_row)
+        status_layout.addWidget(self.busy_bar)
+        layout.addWidget(status_card)
+        self._set_state("ready")
+        self._set_progress_text(0, 0)
+        return card
+
+    def _build_input_bar(self):
+        card = self._make_card()
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(10)
+        label = QLabel("شماره سفارش:")
+        label.setObjectName("boldLabel")
+        self.order_input = QLineEdit()
+        self.order_input.setLayoutDirection(Qt.LeftToRight)
+        self.order_input.setPlaceholderText("شماره سفارش را وارد کنید...  (جداکننده: خط تیره)")
+        self.process_button = QPushButton("▶  پردازش سفارش‌ها")
+        self.process_button.setObjectName("primary")
+        self.process_button.setFixedHeight(40)
+        self.process_button.setMinimumWidth(170)
+        self.settings_button = QPushButton("⚙")
+        self.settings_button.setObjectName("iconButton")
+        self.settings_button.setFixedSize(40, 40)
+        self.settings_button.setToolTip("تنظیمات")
+        layout.addWidget(label)
+        layout.addWidget(self.order_input, 1)
+        layout.addWidget(self.process_button)
+        layout.addWidget(self.settings_button)
+        return card
+
+    def apply_stylesheet(self):
+        """ Modern flat card style. Every rule starts with #content so the settings dialog is unaffected. """
+        self.setStyleSheet("""
+            #content { background-color: #eef3fb; }
+            #content QLabel { background: transparent; color: #1e2a44; font-size: 10pt; }
+            #content QLabel#cardTitle { font-size: 12pt; font-weight: bold; color: #14213d; }
+            #content QLabel#boldLabel { font-weight: bold; }
+            #content QLabel#muted { color: #7a879e; font-size: 9pt; }
+            #content QLabel#badge {
+                background: #e6eefc; color: #2c5bb8; border-radius: 10px;
+                padding: 2px 12px; font-size: 9pt;
+            }
+            #content QFrame#card { background-color: #ffffff; border: 1px solid #dce5f3; border-radius: 14px; }
+            #content QFrame#innerCard { background-color: #f5f8fe; border: 1px solid #e3eaf6; border-radius: 10px; }
+            #content QLineEdit {
+                background: #ffffff; border: 1px solid #d3dcec; border-radius: 10px;
+                padding: 6px 12px; font-size: 10pt; selection-background-color: #2f7dff;
+            }
+            #content QLineEdit:focus { border: 1px solid #2f7dff; }
+            #content QTextEdit#logBox {
+                background: #fbfcfe; border: 1px solid #e3eaf6; border-radius: 10px;
+                padding: 6px; font-size: 10pt;
+            }
+            #content QTableWidget { background: #ffffff; border: none; outline: none; font-size: 10pt; }
+            #content QTableWidget::item { border-bottom: 1px solid #eef2f9; padding: 0px 6px; }
+            #content QHeaderView::section {
+                background: #f0f5fd; color: #52627f; border: none; padding: 0px 6px; font-size: 9pt;
+            }
+            #content QPushButton { font-size: 10pt; border-radius: 10px; padding: 6px 16px; border: none; }
+            #content QPushButton#primary {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3f8dff, stop:1 #1e68eb);
+                color: white; font-weight: bold;
+            }
+            #content QPushButton#primary:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #5a9fff, stop:1 #2f78f5);
+            }
+            #content QPushButton#primary:pressed { background: #1a5bd4; }
+            #content QPushButton#secondary { background: #ffffff; color: #2a3a5c; border: 1px solid #d3dcec; }
+            #content QPushButton#secondary:hover { background: #f1f5fc; }
+            #content QPushButton#iconButton {
+                background: #ffffff; color: #2f7dff; border: 1px solid #d3dcec;
+                font-size: 15pt; padding: 0px;
+            }
+            #content QPushButton#iconButton:hover { background: #f1f5fc; }
+            #content QPushButton:disabled { background: #c9d3e5; color: #f3f6fb; border: none; }
+            #content QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+            #content QScrollBar::handle:vertical { background: #c5d1e8; border-radius: 4px; min-height: 28px; }
+            #content QScrollBar::handle:vertical:hover { background: #a9b9da; }
+            #content QScrollBar::add-line:vertical, #content QScrollBar::sub-line:vertical { height: 0px; }
+            #content QScrollBar::add-page:vertical, #content QScrollBar::sub-page:vertical { background: transparent; }
+        """)
+
+    # --------------------------------------------------------------------------
+    # Small status helpers
+    # --------------------------------------------------------------------------
+    def _set_db_status(self, state):
+        text, color = {
+            "idle": ("برای دریافت فهرست، بروزرسانی را بزنید", "#8a96ad"),
+            "loading": ("در حال دریافت از ERP ...", "#2f7dff"),
+            "ok": ("متصل به دیتابیس", "#1e9e5a"),
+            "error": ("اتصال به دیتابیس ناموفق بود", "#d64545"),
+        }[state]
+        self.db_status_label.setText(f'<span style="color:{color}">●&nbsp;&nbsp;{text}</span>')
+
+    def _set_state(self, state):
+        text, color = {
+            "ready": ("آماده به کار", "#1e9e5a"),
+            "running": ("در حال پردازش ...", "#2f7dff"),
+        }[state]
+        self.state_label.setText(f'<span style="color:{color}">●&nbsp;&nbsp;{text}</span>')
+
+    def _set_progress_text(self, done, total):
+        self.progress_text_label.setText(f"{fa_digits(done)} از {fa_digits(total)} سفارش پردازش شده")
+
+    # --------------------------------------------------------------------------
+    # Order-number box <-> table (they always show the same selection)
+    # --------------------------------------------------------------------------
+    @staticmethod
+    def _parse_numbers(text):
+        """ Order numbers found in free text: keeps the order, drops duplicates ("ORD-5368" -> 5368). """
+        return list(dict.fromkeys(re.findall(r"\d+", text.translate(_DIGITS_TO_LATIN))))
+
+    def _set_input_numbers(self, numbers):
+        text = " - ".join(numbers)
+        self.order_input.setText(text)
+        self._last_input_text = text
+
+    def _input_edited(self, text):
+        """ Typing a separator after a number turns it into ' - ' (deleting is never touched). """
+        if self._syncing:
+            return
+        grew = len(text) > len(self._last_input_text)
+        self._last_input_text = text
+        if grew and text and text[-1] in _INPUT_SEPARATORS and self.order_input.cursorPosition() == len(text):
+            stripped = text.rstrip(_INPUT_SEPARATORS)
+            if stripped and stripped[-1].isdigit():
+                fixed = stripped + " - "
+                if fixed != text:
+                    self.order_input.setText(fixed)
+                    self._last_input_text = fixed
+        self._sync_table_from_input()
+
+    def _normalize_input(self):
+        """ Enter / leaving the box: numbers become 'a - b - c' without duplicates or stray characters. """
+        self._set_input_numbers(self._parse_numbers(self.order_input.text()))
+        self._sync_table_from_input()
+
+    def _sync_table_from_input(self):
+        wanted = set(self._parse_numbers(self.order_input.text()))
+        self._syncing = True
+        try:
+            for row in range(self.orders_table.rowCount()):
+                item = self.orders_table.item(row, 0)
+                state = Qt.Checked if item.data(Qt.UserRole) in wanted else Qt.Unchecked
+                if item.checkState() != state:
+                    item.setCheckState(state)
+        finally:
+            self._syncing = False
+
+    def _on_table_item_changed(self, item):
+        if self._syncing or item.column() != 0:
+            return
+        number = item.data(Qt.UserRole)
+        numbers = self._parse_numbers(self.order_input.text())
+        if item.checkState() == Qt.Checked:
+            if number not in numbers:
+                numbers.append(number)
+        elif number in numbers:
+            numbers.remove(number)
+        self._set_input_numbers(numbers)
+
+    def _on_cell_clicked(self, row, column):
+        """ Clicking anywhere on a row (not only the tick box) toggles it. """
+        if column == 0:
+            return
+        item = self.orders_table.item(row, 0)
+        item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
+
+    def _toggle_all_visible(self, section):
+        """ Clicking the '✓' header ticks every visible row, or clears them if all are already ticked. """
+        if section != 0:
+            return
+        rows = [r for r in range(self.orders_table.rowCount()) if not self.orders_table.isRowHidden(r)]
+        if not rows:
+            return
+        visible = [self.orders_table.item(r, 0).data(Qt.UserRole) for r in rows]
+        numbers = self._parse_numbers(self.order_input.text())
+        if all(number in numbers for number in visible):
+            numbers = [number for number in numbers if number not in visible]
+        else:
+            numbers += [number for number in visible if number not in numbers]
+        self._set_input_numbers(numbers)
+        self._sync_table_from_input()
+
+    def _filter_orders(self, query):
+        query = query.strip().translate(_DIGITS_TO_LATIN).casefold()
+        for row in range(self.orders_table.rowCount()):
+            haystack = " ".join(self.orders_table.item(row, col).text() for col in range(1, 5)).casefold()
+            self.orders_table.setRowHidden(row, bool(query) and query not in haystack)
+
+    # --------------------------------------------------------------------------
+    # Ready-orders list (ERP, read-only)
+    # --------------------------------------------------------------------------
     def scan_order_directory(self):
         """Refresh ready-to-plan orders from SQL Server in read-only mode."""
         self.refresh_button.setDisabled(True)
-        self.confirmed_orders_label.setText("در حال دریافت فهرست از ERP...")
-        self.ready_orders_list.clear()
+        self._set_db_status("loading")
+        QApplication.processEvents()
         try:
             orders, has_serial_timestamp = ErpRepository(CONFIG.settings).list_ready_orders()
-            for order in orders:
-                order_number = str(order.get("order_number", "")).strip()
-                order_date = order.get("order_date")
-                serial_date = order.get("serial_approved_at")
-                order_date_text = order_date.strftime("%Y-%m-%d") if hasattr(order_date, "strftime") else str(order_date or "-")
-                serial_date_text = serial_date.strftime("%Y-%m-%d %H:%M") if hasattr(serial_date, "strftime") else "نامشخص"
-                company = order.get("company_name") or ""
-                label = f"{order_number} | سفارش: {order_date_text} | تأیید سریال: {serial_date_text} | {company} | اقلام: {order.get('item_count', 0)}"
-                item = QListWidgetItem(label)
-                item.setData(Qt.UserRole, order_number)
-                self.ready_orders_list.addItem(item)
+            self._fill_orders_table(orders)
+            self._set_db_status("ok")
             if not has_serial_timestamp:
-                self.confirmed_orders_label.setText("⚠️ در شِمای فعلی ERP تاریخ ایجاد سریال وجود ندارد؛ تاریخ تأیید نمایش‌داده نمی‌شود.")
-            else:
-                self.confirmed_orders_label.setText(f"تعداد سفارش‌های آماده: {len(orders)}")
+                self.update_status("⚠️ در شِمای فعلی ERP تاریخ ایجاد سریال وجود ندارد؛ تاریخ تأیید نمایش‌داده نمی‌شود.")
             self.update_status(f"فهرست ERP بروزرسانی شد؛ {len(orders)} سفارش آماده یافت شد.")
         except Exception as error:
-            self.confirmed_orders_label.setText("دریافت فهرست از ERP ناموفق بود.")
+            self._set_db_status("error")
             self.update_status(f"خطا در دریافت فهرست سفارش‌ها: {error}")
             QMessageBox.warning(self, "خطای اتصال به ERP", str(error))
         finally:
             self.refresh_button.setDisabled(False)
 
-    def add_selected_orders(self):
-        """Append selected ready order numbers to the manual processing input."""
-        selected = [str(item.data(Qt.UserRole)) for item in self.ready_orders_list.selectedItems()]
-        existing = {line.strip() for line in self.order_input.toPlainText().splitlines() if line.strip()}
-        for number in selected:
-            if number not in existing:
-                self.order_input.append(number)
-                existing.add(number)
+    def _fill_orders_table(self, orders):
+        table = self.orders_table
+        self._syncing = True
+        try:
+            table.setRowCount(0)
+            table.setRowCount(len(orders))
+            for row, order in enumerate(orders):
+                number = re.sub(r"^ORD-", "", str(order.get("order_number", "")).strip(), flags=re.IGNORECASE)
+                check = QTableWidgetItem()
+                check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                check.setCheckState(Qt.Unchecked)
+                check.setData(Qt.UserRole, number)
+                serial_date = order.get("serial_approved_at")
+                if hasattr(serial_date, "strftime"):
+                    check.setToolTip(f"تأیید سریال: {jalali_date_text(serial_date)}")
+                table.setItem(row, 0, check)
+                values = [number, order.get("company_name") or "",
+                          jalali_date_text(order.get("order_date")) or "-", str(order.get("item_count", 0))]
+                for col, text in enumerate(values, start=1):
+                    item = QTableWidgetItem(text)
+                    item.setFlags(Qt.ItemIsEnabled)
+                    if col == 2:
+                        item.setTextAlignment(Qt.AlignLeading | Qt.AlignVCenter)
+                    else:
+                        item.setTextAlignment(Qt.AlignCenter)
+                    if col == 1:
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
+                    table.setItem(row, col, item)
+        finally:
+            self._syncing = False
+        self._sync_table_from_input()
+        self._filter_orders(self.order_search.text())
+        self.orders_badge.setText(f"{fa_digits(len(orders))} سفارش")
 
-    def apply_stylesheet(self):
-        """ Applies a custom stylesheet to the application. """
-        self.setStyleSheet("""
-            QWidget { background-color: #f5f7fb; }
-            QLabel { font-size: 10pt; color: #333; }
-            QTextEdit { 
-                background-color: white; border: 1px solid #d0d7df; 
-                border-radius: 6px; padding: 6px; font-size: 10pt; 
-            }
-            QGroupBox { 
-                border: 1px solid #d0d7df; border-radius: 6px; 
-                margin-top: 10px; padding: 10px; 
-            }
-            QGroupBox::title { 
-                subcontrol-origin: margin; subcontrol-position: top center; 
-                padding: 0 5px; 
-            }
-            QLabel#confirmedOrders { color: #28a745; font-size: 10pt; }
-            QPushButton { 
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #5aa9ff, stop:1 #2e7dff); 
-                color: white; border: none; padding: 8px 10px; border-radius: 8px; 
-            }
-            QPushButton:hover { 
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #6bb8ff, stop:1 #3b8bff); 
-            }
-            QPushButton#secondary { 
-                background: #eef4ff; color: #1a3b6e; border: 1px solid #d0dbff; 
-            }
-            QPushButton#secondary:hover { background: #e0e9ff; }
-            QPushButton#actionButton { 
-                background-color: #f0f0f0; color: #333; border: 1px solid #ccc; 
-                text-align: Center; padding: 5px; font-size: 9pt; 
-            }
-            QPushButton#actionButton:hover { background-color: #e9e9e9; border-color: #bbb; }
-            QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }
-        """)
-
+    # --------------------------------------------------------------------------
+    # Processing
+    # --------------------------------------------------------------------------
     def start_processing(self):
         """ Starts the worker thread to process orders. """
-        order_numbers = self.order_input.toPlainText()
-        if not order_numbers.strip():
+        if not self.process_button.isEnabled():
+            return
+        numbers = self._parse_numbers(self.order_input.text())
+        if not numbers:
             QMessageBox.warning(self, "ورودی خالی", "لطفا حداقل یک شماره سفارش وارد کنید.")
             return
-        
+        self._set_input_numbers(numbers)
+        self._sync_table_from_input()
+
         self.process_button.setDisabled(True)
         self.settings_button.setDisabled(True)
+        self.refresh_button.setDisabled(True)
         self.status_box.clear()
-        
+        self.busy_bar.set_progress(0)
+        self._set_progress_text(0, len(numbers))
+        self._set_state("running")
+
         self.thread = QThread()
-        self.worker = Worker(order_numbers, CONFIG.settings)
+        self.worker = Worker("\n".join(numbers), CONFIG.settings)
         self.worker.moveToThread(self.thread)
-        
+
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
-        
+
         self.worker.status_update.connect(self.update_status)
         self.worker.error_signal.connect(self.show_error_message)
         self.worker.warning_signal.connect(self.show_warning_message)
         self.worker.info_signal.connect(self.show_info_message)
         self.worker.busy_changed.connect(self.set_busy)
-        
-        self.thread.finished.connect(self.busy_bar.stop)
-        self.thread.finished.connect(lambda: self.process_button.setDisabled(False))
-        self.thread.finished.connect(lambda: self.settings_button.setDisabled(False))
-        
+        self.worker.progress_changed.connect(self.set_progress)
+
+        self.thread.finished.connect(self._processing_finished)
         self.thread.start()
 
+    def _processing_finished(self):
+        self.busy_bar.stop()
+        self._set_state("ready")
+        self.process_button.setDisabled(False)
+        self.settings_button.setDisabled(False)
+        self.refresh_button.setDisabled(False)
+
     def set_busy(self, busy):
-        """ Shows/hides the animated bar under the status report. """
+        """ Starts/stops the moving stripes of the status bar. """
         if busy:
             self.busy_bar.start()
         else:
             self.busy_bar.stop()
 
-    def fit_to_screen(self, height_ratio=0.7):
-        """ Window height = 70% of the usable screen height (taskbar excluded), centered. """
+    def set_progress(self, done, total):
+        """ 'x of y orders processed': fills the bar as orders are completed. """
+        self.busy_bar.set_progress(done / total if total else 0)
+        self._set_progress_text(done, total)
+
+    # --------------------------------------------------------------------------
+    # Window size / position
+    # --------------------------------------------------------------------------
+    def showEvent(self, event):
+        """ On the first show, size and place the window (see fit_to_screen). """
+        super().showEvent(event)
+        if not getattr(self, "_screen_fitted", False):
+            self._screen_fitted = True
+            # Run after the window frame exists, so the real title-bar/border size is known.
+            QTimer.singleShot(0, self.fit_to_screen)
+
+    def fit_to_screen(self):
+        """ Opens the window at the shortest height its boxes allow (see ORDER_TABLE_VISIBLE_ROWS and
+        LOG_BOX_MIN_HEIGHT), never taller than WINDOW_MAX_HEIGHT_RATIO of the usable screen height,
+        centered on screen. """
         screen = self.screen() if hasattr(self, "screen") else QApplication.primaryScreen()
-        available = screen.availableGeometry()
+        available = screen.availableGeometry()           # usable area: the taskbar is excluded
         frame_h = self.frameGeometry().height() - self.geometry().height()   # title bar + borders
         frame_w = self.frameGeometry().width() - self.geometry().width()
-        total_h = int(available.height() * height_ratio)
+        if frame_h <= 0:   # window frame not measured yet: estimate title bar + borders
+            frame_h = self.style().pixelMetric(QStyle.PM_TitleBarHeight) + 8
+            frame_w = max(frame_w, 16)
+        wanted_h = WINDOW_DEFAULT_HEIGHT or self.minimumSizeHint().height()
+        total_h = min(wanted_h + frame_h, int(available.height() * WINDOW_MAX_HEIGHT_RATIO))
         total_w = min(self.width() + frame_w, available.width())
         self.resize(total_w - frame_w, total_h - frame_h)
-        self.move(available.x() + (available.width() - total_w) // 2,
-                  available.y() + (available.height() - total_h) // 2)
+        real_h = self.frameGeometry().height()           # Qt never goes below the minimum height
+        self.move(available.x() + (available.width() - self.frameGeometry().width()) // 2,
+                  max(available.y(), available.y() + (available.height() - real_h) // 2))
+
+    # --------------------------------------------------------------------------
+    # Report box and message boxes
+    # --------------------------------------------------------------------------
+    @staticmethod
+    def _log_color(line):
+        stripped = line.strip()
+        if stripped.startswith("====="):
+            return "#1f5fd8", True
+        if any(mark in stripped for mark in ("✘", "❌", "❗", "خطا")):
+            return "#d64545", False
+        if "⚠" in stripped:
+            return "#d98200", False
+        if any(mark in stripped for mark in ("✔", "✅", "💯")):
+            return "#1e9e5a", False
+        if any(mark in stripped for mark in ("🌀", "⏳", "🔎")):
+            return "#3b6fd4", False
+        return "#2b3650", False
 
     def update_status(self, message):
-        """ Appends a message to the status box. """
-        self.status_box.append(message)
+        """ Adds a message to the report box: time stamp + color by message type (scrolls to the end). """
+        lines = message.split("\n")
+        while lines and not lines[-1].strip():
+            lines.pop()
+        stamp = time.strftime("%H:%M:%S")
+        stamped = False
+        for line in lines:
+            if not line.strip():
+                continue
+            color, bold = self._log_color(line)
+            text = html_lib.escape(line.strip("\r")).replace("  ", "&nbsp;&nbsp;")
+            if bold:
+                text = f"<b>{text}</b>"
+            prefix = "" if stamped else f'<span style="color:#98a2b8; font-size:9pt">{stamp}</span>&nbsp;&nbsp;'
+            stamped = True
+            self.status_box.append(f'{prefix}<span style="color:{color}">{text}</span>')
         self.status_box.verticalScrollBar().setValue(self.status_box.verticalScrollBar().maximum())
 
     def show_error_message(self, title, message):
@@ -1181,12 +1625,13 @@ class ProdPlanApp(QWidget):
     def show_info_message(self, title, message):
         """ Shows an informational message box. """
         QMessageBox.information(self, title, message)
-    
+
     def show_settings(self):
         """ Opens the settings dialog. """
         dialog = SettingsDialog(CONFIG, self)
         if dialog.exec_() == QDialog.Accepted:
             self.scan_order_directory()
+
 
 # ==============================================================================
 # Main Execution Block
@@ -1234,7 +1679,6 @@ def main():
             timer.stop()
             splash.close()
             main_window.show()
-            main_window.fit_to_screen()
 
     timer = QTimer()
     timer.timeout.connect(update_progress)
@@ -1244,4 +1688,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
