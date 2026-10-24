@@ -1,4 +1,4 @@
-"""Read-only access to Fardan ERP sales orders."""
+"""Access Fardan ERP sales orders and record production-sheet preparation."""
 import os
 import keyring
 import pyodbc
@@ -17,7 +17,7 @@ def _extract_delivery_time(conditions):
 
 
 class ErpRepository:
-    """Provides parameterized, read-only queries to the Fardan OLTP database."""
+    """Provides parameterized queries and production-sheet status updates for Fardan OLTP."""
 
     def __init__(self, settings):
         self.settings = settings
@@ -58,14 +58,30 @@ class ErpRepository:
         connection_string = (
             f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};"
             f"{auth}Encrypt=yes;TrustServerCertificate=yes;Connection Timeout=8;"
-            "ApplicationIntent=ReadOnly;"
         )
-        return pyodbc.connect(connection_string, readonly=True, autocommit=True)
+        return pyodbc.connect(connection_string, autocommit=False)
 
     def test_connection(self, password_override=None):
-        """Open a read-only connection and run a harmless connectivity check."""
+        """Open a connection and run a harmless connectivity check."""
         with self._connect(password_override=password_override) as connection:
             connection.cursor().execute("SELECT 1").fetchone()
+
+    def mark_production_sheet_prepared(self, order_number):
+        """Record the latest successful production-sheet generation for one order."""
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            cursor.execute("""
+                UPDATE sales.orders
+                SET production_sheet_prepared = 1,
+                    production_sheet_prepared_at = SYSUTCDATETIME()
+                WHERE order_number = ? AND is_active = 1
+            """, (order_number,))
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise RuntimeError(
+                    f"وضعیت برگه تولید برای سفارش {order_number} در ERP به‌روزرسانی نشد."
+                )
+            connection.commit()
 
     @staticmethod
     def _has_serial_timestamp(cursor):
@@ -106,6 +122,7 @@ class ErpRepository:
                 INNER JOIN sales.companies c ON c.company_id = o.company_id
                 INNER JOIN sales.order_details od ON od.order_id = o.order_id
                 WHERE o.is_active = 1
+                  AND o.production_sheet_prepared = 0
                 GROUP BY o.order_id, o.order_number, o.order_date, c.company_name
                 HAVING COUNT(od.order_detail_id) > 0
                    AND COUNT(od.production_serial) = COUNT(od.order_detail_id)
