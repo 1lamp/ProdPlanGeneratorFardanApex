@@ -15,6 +15,7 @@ import sys
 import json
 import time
 import shutil
+import tempfile
 import html as html_lib
 
 import keyring
@@ -28,14 +29,14 @@ import xlwings as xw
 from PyPDF2 import PdfWriter
 from PyQt5.QtCore import QObject, QThread, pyqtSignal, Qt, QTimer, QPointF, QRectF
 from PyQt5.QtGui import (
-    QFont, QIcon, QPixmap, QFontDatabase, QPainter, QPainterPath, QColor, QPolygonF
+    QFont, QIcon, QPixmap, QFontDatabase, QPainter, QPainterPath, QColor, QPolygonF, QPen
 )
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QTextEdit, QLabel, QMessageBox, QSplashScreen, QProgressBar, QStyle,
     QGroupBox, QDialog, QLineEdit, QFileDialog, QCheckBox, QRadioButton,
     QListWidget, QListWidgetItem, QComboBox, QGridLayout, QFrame, QTableWidget,
-    QTableWidgetItem, QHeaderView, QAbstractItemView
+    QTableWidgetItem, QHeaderView, QAbstractItemView, QStackedWidget
 )
 
 # ==============================================================================
@@ -83,7 +84,8 @@ class ConfigManager:
             "delete_temp_files": True,
             "create_preparation_excel": True,
             "print_preparation_pdf": True,
-            "print_timing_pdf": True
+            "print_timing_pdf": True,
+            "report_level": "detailed"
         }
         self.save()
 
@@ -107,13 +109,13 @@ COL_QUANTITY = "تعداد"
 # more content than fits, so they never make the window taller than this.
 ORDER_TABLE_VISIBLE_ROWS = 4   # rows of the orders table visible before it scrolls
 ORDER_ROW_HEIGHT = 30          # height of one table row (and of the table header)
-LOG_BOX_MIN_HEIGHT = 250       # minimum height of the "گزارش پردازش" box
-WINDOW_DEFAULT_WIDTH = 900    # window width when the program opens
-WINDOW_DEFAULT_HEIGHT = None   # None = shortest possible height; or a number such as 500 to choose it
+LOG_BOX_MIN_HEIGHT = 110       # minimum height of the "گزارش پردازش" box
+WINDOW_DEFAULT_WIDTH = 950    # window width when the program opens
+WINDOW_DEFAULT_HEIGHT = 500   # None = shortest possible height; or a number such as 500 to choose it
                                # (never below the minimum the boxes need, never above the safety limit)
 # Safety limit: the window is never taller than this fraction of the usable screen height
 # (the Windows taskbar is not counted as usable), so it can not slide under the taskbar.
-WINDOW_MAX_HEIGHT_RATIO = 0.85
+WINDOW_MAX_HEIGHT_RATIO = 0.95
 
 # --- Input Cells in LOM Sheet ---
 CELL_PRODUCT_CODE = "I4"
@@ -277,6 +279,24 @@ class Worker(QObject):
         self.config = config_settings
         self.db_wb = None # To hold the workbook object
     
+    # --- Report detail level (the "report_level" setting) -----------------------------
+    # "detailed": every message is shown.  "summary": only the messages matched below.
+    _SUMMARY_MARKS = ("✘", "❗", "⚠", "خطا")                    # errors and warnings
+    _SUMMARY_PHRASES = (
+        "ادغام شده برای سفارش",                                 # final merged PDFs of an order
+        "فایل اکسل آماده سازی برای سفارش",                       # final preparation Excel of an order
+        "💯",                                                   # end of processing
+    )                                                           # (order headers start with "=====")
+
+    def _log(self, message):
+        """ Sends a message to the report box, respecting the chosen report detail level. """
+        if self.config.get("report_level", "detailed") == "summary":
+            text = message.strip()
+            if not (text.startswith("=====")
+                    or any(mark in text for mark in self._SUMMARY_MARKS + self._SUMMARY_PHRASES)):
+                return
+        self.status_update.emit(message)
+
     def find_last_numeric_row(self, sheet, search_range):
         """ Finds the last row with a numeric value in a given range. """
         values = sheet.range(search_range).options(ndim=1).value
@@ -296,12 +316,12 @@ class Worker(QObject):
                 check_val = str(sheet.range(config['check_cell']).value).strip().upper()
                 sheet.range(config['cell_flag']).value = (check_val == 'FALSE')
             sheet.range(config['print_range']).api.ExportAsFixedFormat(0, pdf_filepath)
-            self.status_update.emit(
+            self._log(
                 f"    ✔ چاپ {sheet.name} انجام شد:\n"
             )
             return True
         except Exception as e:
-            self.status_update.emit(
+            self._log(
                 f"    ✘ خطا در چاپ {sheet.name}: {e}\n"
             )
             return False
@@ -318,7 +338,7 @@ class Worker(QObject):
 
         # Check if the product code is valid in the database
         if str(db_sheet.range(CELL_CHECK).value).strip().lower() == 'empty':
-            self.status_update.emit(
+            self._log(
                 f"  ❗ هشدار: کد محصول {product_code} در دیتابیس نامعتبر است. این آیتم نادیده گرفته شد.\n"
             )
             return mergers, files_to_delete, preparation_excel_data
@@ -343,7 +363,7 @@ class Worker(QObject):
             if not print_range: has_data = False
 
             if not has_data:
-                self.status_update.emit(
+                self._log(
                     f"    ✘ {suffix} اطلاعاتی برای پردازش ندارد.\n"
                     )
                 continue
@@ -351,12 +371,12 @@ class Worker(QObject):
             print_this_pdf = True
             if suffix == "زمانسنجی" and not self.config.get('print_timing_pdf', True):
                 print_this_pdf = False
-                self.status_update.emit(
+                self._log(
                     f"    - چاپ {suffix} بر اساس تنظیمات غیرفعال است.\n"
                 )
             if suffix == "آماده سازی" and not self.config.get('print_preparation_pdf', True):
                 print_this_pdf = False
-                self.status_update.emit(
+                self._log(
                     f"    - چاپ {suffix} بر اساس تنظیمات غیرفعال است.\n"
                 )
             
@@ -367,7 +387,7 @@ class Worker(QObject):
                 if job_type == 'main': main_merger.append(pdf_filepath)
                 elif job_type == 'preparation': preparation_merger.append(pdf_filepath)
                 elif job_type == 'timing': timing_merger.append(pdf_filepath)
-                self.status_update.emit(
+                self._log(
                     f"    ✔ پرینت {suffix} برای {product_code} ذخیره شد.\n"
                 )
             
@@ -378,11 +398,11 @@ class Worker(QObject):
                         if row_data[0]:
                             new_row = {"شماره سفارش": order_num, "کد محصول": product_code, "شرح کالا": row_data[0], "تعداد": row_data[1], "اندازه برش": row_data[2]}
                             preparation_excel_data.append(new_row)
-                    self.status_update.emit(
+                    self._log(
                         f"    ✔ داده‌های اکسل آماده‌سازی برای {product_code} استخراج شد.\n"
                     )
                 except Exception as e:
-                    self.status_update.emit(
+                    self._log(
                         f"    ✘ خطا در استخراج داده‌های اکسل آماده‌سازی: {e}\n"
                     )
 
@@ -421,7 +441,7 @@ class Worker(QObject):
                 main_merger.append(pdf_filepath); files_to_delete.append(pdf_filepath)
 
         if product_type in ('TS', 'TF'):
-            self.status_update.emit(
+            self._log(
                 f"    - در حال بررسی نقشه فنی برای محصول ({product_code})\n"
             )
 
@@ -434,9 +454,9 @@ class Worker(QObject):
                 shutil.copy(source_drawing_path, dest_drawing_path)
                 main_merger.append(dest_drawing_path)
                 files_to_delete.append(dest_drawing_path)
-                self.status_update.emit(f"    ✔ نقشه فنی برای {product_code} کپی شد.\n")
+                self._log(f"    ✔ نقشه فنی برای {product_code} کپی شد.\n")
             else:
-                self.status_update.emit(f"    ✘ هشدار: نقشه فنی {os.path.basename(source_drawing_path)} یافت نشد.\n")
+                self._log(f"    ✘ هشدار: نقشه فنی {os.path.basename(source_drawing_path)} یافت نشد.\n")
 
         return (main_merger, preparation_merger, timing_merger), files_to_delete, preparation_excel_data
 
@@ -480,10 +500,10 @@ class Worker(QObject):
 
             # Avoid double-prefixing if a user pastes a number in ORD-<number> format.
             order_numbers_list = [f"ORD-{number}" for number in entered_order_numbers]
-            self.status_update.emit(
+            self._log(
                 f"شماره‌های سفارش برای پردازش:\n{entered_order_numbers}\n"
             )
-            self.status_update.emit("⏳ در حال دریافت سفارش‌ها از ERP . . .\n")
+            self._log("⏳ در حال دریافت سفارش‌ها از ERP (فقط‌خواندنی) . . .\n")
             erp_orders_raw = ErpRepository(self.config).get_orders_for_processing(order_numbers_list)
             if not erp_orders_raw:
                 self.warning_signal.emit("یافت نشد", "برای شماره‌های واردشده، سفارش فعالی در ERP یافت نشد.")
@@ -505,10 +525,10 @@ class Worker(QObject):
             filtered_df = pd.DataFrame(rows)
             missing_orders = [number for number in entered_order_numbers if number not in erp_orders]
             if missing_orders:
-                self.status_update.emit(f"⚠️ سفارش‌های فعال یافت‌نشده: {', '.join(missing_orders)}\n")
-            self.status_update.emit(f"🔎 تعداد {len(filtered_df)} قلم از ERP دریافت شد.\n")
+                self._log(f"⚠️ سفارش‌های فعال یافت‌نشده: {', '.join(missing_orders)}\n")
+            self._log(f"🔎 تعداد {len(filtered_df)} قلم از ERP دریافت شد.\n")
 
-            self.status_update.emit(
+            self._log(
                 "   🌀 شروع پردازش اکسل دیتابیس محصولات و چاپ برگه‌ها . . .\n"
             )
             self.busy_changed.emit(True)   # the animated bar appears right after the message above
@@ -521,7 +541,7 @@ class Worker(QObject):
                 self.progress_changed.emit(0, total_orders)
                 for order_num, group in filtered_df.groupby(COL_ORDER_NUM.strip()):
                     order_num_str = str(order_num)
-                    self.status_update.emit(
+                    self._log(
                         f"=======   شروع پردازش سفارش شماره {order_num_str}   =======\n"
                     )
                     order_folder = os.path.join(output_base_path, order_num_str)
@@ -535,9 +555,9 @@ class Worker(QObject):
                             create_order_sheet_pdf(order_metadata, order_sheet_path, resource_path("IRAN.ttf"))
                             main_merger.append(order_sheet_path)
                             files_to_delete.append(order_sheet_path)
-                            self.status_update.emit(f"✔ برگه سفارش از ERP ساخته شد: {order_sheet_path}\n")
+                            self._log(f"✔ برگه سفارش از ERP ساخته شد: {order_sheet_path}\n")
                         except Exception as error:
-                            self.status_update.emit(f"✘ ساخت برگه سفارش ERP ناموفق بود: {error}\n")
+                            self._log(f"✘ ساخت برگه سفارش ERP ناموفق بود: {error}\n")
                     preparation_excel_data = []
                     preparation_excel_headers = [
                         "ردیف",
@@ -555,7 +575,7 @@ class Worker(QObject):
                     for _, row in group.iterrows():
                         original_product_code = str(row[COL_PRODUCT_CODE.strip()])
                         quantity = row[COL_QUANTITY.strip()]
-                        self.status_update.emit(
+                        self._log(
                             f"\n   ✨  بررسی کد محصول {original_product_code}\n"
                         )
                         
@@ -572,13 +592,13 @@ class Worker(QObject):
                                 else: break
                         
                         if not valid_product_codes:
-                            self.status_update.emit(
+                            self._log(
                                 f"  ❗ هشدار: محصول {original_product_code} نامعتبر است. این آیتم نادیده گرفته شد.\n"
                             )
                             continue
                         
                         for final_code in valid_product_codes:
-                            self.status_update.emit(
+                            self._log(
                                 f"          🚀 شروع فرآیند چاپ برای کد محصول {final_code}\n"
                             )
                             
@@ -599,16 +619,16 @@ class Worker(QObject):
                                             sub_components.extend(found_codes)
                                 sub_components = sorted(list(set(sub_components)))
                             except Exception as e:
-                                self.status_update.emit(
+                                self._log(
                                     f"  ✘ خطا در جستجوی قطعات جانبی: {e}\n"
                                 )
 
                             if sub_components:
-                                self.status_update.emit(
+                                self._log(
                                     f"  🔍 قطعات جانبی یافت شد: {', '.join(sub_components)}\n"
                                 )
                                 for sub_code in sub_components:
-                                    self.status_update.emit(
+                                    self._log(
                                         f"    🚀 شروع فرآیند چاپ برای {sub_code}\n"
                                     )
                                     mergers, files_to_delete, preparation_excel_data = self._process_product(
@@ -621,15 +641,15 @@ class Worker(QObject):
                     if len(main_merger.pages) > 0:
                         final_main_pdf_path = os.path.join(order_folder, merged_pdf_filename(order_metadata, order_num_str))
                         with open(final_main_pdf_path, "wb") as f: main_merger.write(f)
-                        self.status_update.emit(f"  ✔ فایل اصلی ادغام شده برای سفارش {order_num_str} ذخیره شد.\n")
+                        self._log(f"  ✔ فایل اصلی ادغام شده برای سفارش {order_num_str} ذخیره شد.\n")
 
                     if len(preparation_merger.pages) > 0:
                         with open(os.path.join(order_folder, f"آماده سازی({order_num_str}).pdf"), "wb") as f: preparation_merger.write(f)
-                        self.status_update.emit(f"  ✔ فایل آماده سازی ادغام شده برای سفارش {order_num_str} ذخیره شد.\n")
+                        self._log(f"  ✔ فایل آماده سازی ادغام شده برای سفارش {order_num_str} ذخیره شد.\n")
                     
                     if len(timing_merger.pages) > 0:
                         with open(os.path.join(order_folder, f"زمانسنجی({order_num_str}).pdf"), "wb") as f: timing_merger.write(f)
-                        self.status_update.emit(f"  ✔ فایل زمانسنجی ادغام شده برای سفارش {order_num_str} ذخیره شد.\n")
+                        self._log(f"  ✔ فایل زمانسنجی ادغام شده برای سفارش {order_num_str} ذخیره شد.\n")
 
                     if self.config.get('create_preparation_excel', False) and preparation_excel_data:
                         try:
@@ -638,19 +658,19 @@ class Worker(QObject):
                             df_prep.insert(0, 'ردیف', range(1, len(df_prep) + 1))
                             df_prep = df_prep.reindex(columns=preparation_excel_headers)
                             df_prep.to_excel(prep_excel_path, index=False, engine='openpyxl')
-                            self.status_update.emit(f"  ✔ فایل اکسل آماده سازی برای سفارش {order_num_str} ذخیره شد.\n")
+                            self._log(f"  ✔ فایل اکسل آماده سازی برای سفارش {order_num_str} ذخیره شد.\n")
                         except Exception as e:
-                            self.status_update.emit(f"  ✘ خطا در ذخیره فایل اکسل آماده سازی: {e}\n")
+                            self._log(f"  ✘ خطا در ذخیره فایل اکسل آماده سازی: {e}\n")
                     
                     main_merger.close(); preparation_merger.close(); timing_merger.close()
 
                     if self.config['delete_temp_files'] and files_to_delete:
-                        self.status_update.emit(
+                        self._log(
                             f"\n  ⏳ شروع پاکسازی فایل‌های موقت برای سفارش {order_num_str} . . .\n"
                         )
                         if final_main_pdf_path and final_main_pdf_path in files_to_delete:
                             files_to_delete.remove(final_main_pdf_path)
-                            self.status_update.emit(
+                            self._log(
                                 f"    - فایل نهایی {os.path.basename(final_main_pdf_path)} از لیست حذف خارج شد.\n"
                             )
                         deleted_count = 0
@@ -658,25 +678,12 @@ class Worker(QObject):
                             try:
                                 if os.path.exists(file_path): os.remove(file_path); deleted_count += 1
                             except Exception as e:
-                                self.status_update.emit(
+                                self._log(
                                     f"    ❗ خطا در حذف فایل {os.path.basename(file_path)}: {e}\n"
                                 )
-                        self.status_update.emit(
+                        self._log(
                             f"    ✔ {deleted_count} فایل موقت با موفقیت حذف شد.\n"
                         )
-
-                    # Mark the order only after the final merged production PDF was written.
-                    # Manually entered order numbers are still processed regardless of this flag.
-                    if final_main_pdf_path and os.path.isfile(final_main_pdf_path):
-                        try:
-                            ErpRepository(self.config).mark_production_sheet_prepared(f"ORD-{order_num_str}")
-                            self.status_update.emit(
-                                f"✔ وضعیت برگه تولید سفارش {order_num_str} در ERP ثبت شد.\n"
-                            )
-                        except Exception as status_error:
-                            self.status_update.emit(
-                                f"✘ فایل خروجی ساخته شد، اما ثبت وضعیت برگه تولید در ERP ناموفق بود: {status_error}\n"
-                            )
 
                     processed_orders += 1
                     self.progress_changed.emit(processed_orders, total_orders)
@@ -686,12 +693,12 @@ class Worker(QObject):
                 try:
                     self.db_wb.close()
                 except Exception as close_error:
-                    self.status_update.emit(
+                    self._log(
                         f"⚠️ بستن فایل اکسل دیتابیس با خطا مواجه شد: {close_error}\n"
                     )
                 finally:
                     self.db_wb = None
-                self.status_update.emit(
+                self._log(
                     "\n💯 عملیات پردازش با موفقیت به پایان رسید.\n"
                 )
                 self.info_signal.emit(
@@ -705,14 +712,14 @@ class Worker(QObject):
             self.error_signal.emit(
                 "خطای فایل", msg
             )
-            self.status_update.emit(
+            self._log(
                 f"خطا در یافتن فایل: {e}\n"
             )
         except Exception as e:
             self.error_signal.emit(
                 "خطای کلی", f"یک خطای ناشناخته در برنامه رخ داد:\n{e}"
             )
-            self.status_update.emit(
+            self._log(
                 f"خطای بحرانی: {e}\n"
             )
         finally:
@@ -723,7 +730,7 @@ class Worker(QObject):
                 try:
                     workbook.close()
                 except Exception as close_error:
-                    self.status_update.emit(
+                    self._log(
                         f"⚠️ هنگام بستن فایل اکسل دیتابیس خطا رخ داد: {close_error}\n"
                     )
             self.busy_changed.emit(False)
@@ -732,67 +739,442 @@ class Worker(QObject):
 # ==============================================================================
 # Settings Dialog Window
 # ==============================================================================
-# Style of the settings dialog (the main window has its own, newer style).
-DIALOG_STYLESHEET = """
-            QWidget { background-color: #f5f7fb; }
-            QLabel { font-size: 10pt; color: #333; }
-            QTextEdit { 
-                background-color: white; border: 1px solid #d0d7df; 
-                border-radius: 6px; padding: 6px; font-size: 10pt; 
-            }
-            QGroupBox { 
-                border: 1px solid #d0d7df; border-radius: 6px; 
-                margin-top: 10px; padding: 10px; 
-            }
-            QGroupBox::title { 
-                subcontrol-origin: margin; subcontrol-position: top center; 
-                padding: 0 5px; 
-            }
-            QLabel#confirmedOrders { color: #28a745; font-size: 10pt; }
-            QPushButton { 
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #5aa9ff, stop:1 #2e7dff); 
-                color: white; border: none; padding: 8px 10px; border-radius: 8px; 
-            }
-            QPushButton:hover { 
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #6bb8ff, stop:1 #3b8bff); 
-            }
-            QPushButton#secondary { 
-                background: #eef4ff; color: #1a3b6e; border: 1px solid #d0dbff; 
-            }
-            QPushButton#secondary:hover { background: #e0e9ff; }
-            QPushButton#actionButton { 
-                background-color: #f0f0f0; color: #333; border: 1px solid #ccc; 
-                text-align: Center; padding: 5px; font-size: 9pt; 
-            }
-            QPushButton#actionButton:hover { background-color: #e9e9e9; border-color: #bbb; }
-            QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }
-        """
+# ==============================================================================
+# Settings window (modern card design)
+# ==============================================================================
+SETTINGS_DIALOG_WIDTH = 640    # minimum width of the settings window (pixels)
+SETTING_CARD_MIN_HEIGHT = 112  # height of the four cards on the settings home page (pixels)
+
+# Only used by the About window (opened from the settings window).
+ABOUT_STYLESHEET = """
+    QWidget { background-color: #f5f7fb; }
+    QLabel { font-size: 10pt; color: #333; }
+"""
+
+SETTINGS_STYLESHEET = """
+    #settingsPanel { background-color: #eef3fb; }
+    #settingsPanel QLabel { background: transparent; color: #1e2a44; font-size: 10pt; }
+    #settingsPanel QLabel#pageTitle { font-size: 16pt; font-weight: bold; color: #14213d; }
+    #settingsPanel QLabel#cardName { font-size: 12pt; font-weight: bold; color: #14213d; }
+    #settingsPanel QLabel#boldSmall { font-weight: bold; color: #3a4a68; }
+    #settingsPanel QLabel#muted { color: #7a879e; font-size: 9pt; }
+    #settingsPanel QLabel#formLabel { color: #3a4a68; }
+    #settingsPanel QFrame#settingCard { background: #ffffff; border: 1px solid #dce5f3; border-radius: 14px; }
+    #settingsPanel QFrame#settingCard:hover { background: #f8fbff; border: 1px solid #9bbcf5; }
+    #settingsPanel QFrame#sectionBox { background: #ffffff; border: 1px solid #dce5f3; border-radius: 14px; }
+    #settingsPanel QFrame#choiceCard { background: #ffffff; border: 2px solid #dce5f3; border-radius: 14px; }
+    #settingsPanel QFrame#choiceCard:hover { border: 2px solid #9bbcf5; }
+    #settingsPanel QFrame#choiceCard[selected="true"] { background: #f3f8ff; border: 2px solid #2f7dff; }
+    #settingsPanel QLineEdit, #settingsPanel QComboBox {
+        background: #ffffff; border: 1px solid #d3dcec; border-radius: 10px;
+        padding: 6px 12px; font-size: 10pt; selection-background-color: #2f7dff;
+    }
+    #settingsPanel QLineEdit:focus, #settingsPanel QComboBox:focus { border: 1px solid #2f7dff; }
+    #settingsPanel QCheckBox { background: transparent; font-size: 10pt; spacing: 8px; }
+    #settingsPanel QCheckBox::indicator {
+        width: 18px; height: 18px; border: 1.5px solid #b8c5dc; border-radius: 5px; background: #ffffff;
+    }
+    #settingsPanel QCheckBox::indicator:hover { border-color: #2f7dff; }
+    #settingsPanel QCheckBox::indicator:checked { background: #2f7dff; border-color: #2f7dff; __CHECK_IMAGE__ }
+    #settingsPanel QPushButton { font-size: 10pt; border-radius: 10px; padding: 8px 18px; border: none; }
+    #settingsPanel QPushButton#primary {
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3f8dff, stop:1 #1e68eb);
+        color: white; font-weight: bold;
+    }
+    #settingsPanel QPushButton#primary:hover {
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #5a9fff, stop:1 #2f78f5);
+    }
+    #settingsPanel QPushButton#secondary { background: #ffffff; color: #2a3a5c; border: 1px solid #d3dcec; }
+    #settingsPanel QPushButton#secondary:hover { background: #f1f5fc; }
+    #settingsPanel QPushButton:disabled { background: #c9d3e5; color: #f3f6fb; border: none; }
+"""
+
+def _check_mark_style():
+    """ A white tick image for checked boxes, written once to the temp folder (style sheets need a file). """
+    try:
+        path = os.path.join(tempfile.gettempdir(), "prodplan_check_mark.png")
+        if not os.path.exists(path):
+            pixmap = QPixmap(18, 18)
+            pixmap.fill(Qt.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(QPen(QColor("#ffffff"), 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPolyline(QPolygonF([QPointF(4.5, 9.5), QPointF(7.8, 12.8), QPointF(13.5, 5.8)]))
+            painter.end()
+            pixmap.save(path, "PNG")
+        return 'image: url("' + path.replace("\\", "/") + '");'
+    except Exception:
+        return ""     # without the image a checked box is simply filled blue
+
+
+def rtl_text(text):
+    """ Forces right-to-left reading order (U+202B ... U+202C): labels that start with a bullet or
+    mix Persian and English then show in the correct order. """
+    return "\u202b" + text + "\u202c"
+
+
+class IconTile(QWidget):
+    """ Small drawn icon, optionally on a rounded light-blue tile. kind: database | folder | document |
+    report | gear. Drawn with QPainter, so it never depends on an icon font. """
+    COLOR = QColor("#2f7dff")
+    LIGHT = QColor("#8db8ff")
+    TILE = QColor("#e6eefc")
+
+    def __init__(self, kind, size=44, tile=True, color=None):
+        super().__init__()
+        self.kind = kind
+        self.tile = tile
+        self.color = QColor(color) if color else self.COLOR
+        self.setFixedSize(size, size)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        full = QRectF(self.rect())
+        if self.tile:
+            p.setPen(Qt.NoPen)
+            p.setBrush(self.TILE)
+            p.drawRoundedRect(full, full.width() * 0.28, full.width() * 0.28)
+            pad = full.width() * 0.27
+        else:
+            pad = full.width() * 0.04
+        r = full.adjusted(pad, pad, -pad, -pad)
+        getattr(self, "_draw_" + self.kind)(p, r)
+
+    def _draw_database(self, p, r):
+        w, eh = r.width(), r.height() * 0.30
+        left, top, bottom = r.left(), r.top(), r.bottom()
+        body = QPainterPath()
+        body.moveTo(left, top + eh / 2)
+        body.lineTo(left, bottom - eh / 2)
+        body.arcTo(QRectF(left, bottom - eh, w, eh), 180, 180)
+        body.lineTo(left + w, top + eh / 2)
+        body.arcTo(QRectF(left, top, w, eh), 0, 180)
+        p.setPen(Qt.NoPen)
+        p.setBrush(self.color)
+        p.drawPath(body)
+        p.setBrush(self.LIGHT)
+        p.drawEllipse(QRectF(left, top, w, eh))
+        p.setPen(QPen(self.TILE, 1.6))
+        p.setBrush(Qt.NoBrush)
+        for k in (1, 2):
+            y = top + (r.height() - eh) * k / 3
+            p.drawArc(QRectF(left, y, w, eh), 180 * 16, 180 * 16)
+
+    def _draw_folder(self, p, r):
+        p.setPen(Qt.NoPen)
+        p.setBrush(self.LIGHT)
+        p.drawRoundedRect(QRectF(r.left(), r.top() + r.height() * 0.08, r.width() * 0.45, r.height() * 0.30), 2.5, 2.5)
+        p.setBrush(self.color)
+        p.drawRoundedRect(QRectF(r.left(), r.top() + r.height() * 0.26, r.width(), r.height() * 0.66), 3.5, 3.5)
+
+    def _draw_document(self, p, r):
+        page = QRectF(r.left() + r.width() * 0.14, r.top(), r.width() * 0.72, r.height())
+        p.setPen(Qt.NoPen)
+        p.setBrush(self.color)
+        p.drawRoundedRect(page, 3.5, 3.5)
+        p.setBrush(QColor("#ffffff"))
+        for k in range(3):
+            y = page.top() + page.height() * (0.36 + 0.18 * k)
+            w = page.width() * (0.62 if k < 2 else 0.38)
+            p.drawRoundedRect(QRectF(page.right() - page.width() * 0.16 - w, y, w, 2.2), 1.1, 1.1)
+
+    def _draw_report(self, p, r):
+        p.setPen(Qt.NoPen)
+        p.setBrush(self.color)
+        p.drawRoundedRect(r, 3.5, 3.5)
+        p.setPen(QPen(self.TILE, 1.6))
+        for k in (1, 2):
+            y = r.top() + r.height() * k / 3
+            p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+        p.drawLine(QPointF(r.center().x(), r.top() + r.height() / 3), QPointF(r.center().x(), r.bottom()))
+
+    def _draw_gear(self, p, r):
+        p.translate(r.center())
+        radius = r.width() / 2
+        p.setPen(Qt.NoPen)
+        p.setBrush(self.color)
+        for _ in range(8):
+            p.drawRoundedRect(QRectF(-radius * 0.17, -radius, radius * 0.34, radius * 0.42), 1.5, 1.5)
+            p.rotate(45)
+        p.drawEllipse(QPointF(0, 0), radius * 0.76, radius * 0.76)
+        p.setBrush(QColor("#eef3fb"))
+        p.drawEllipse(QPointF(0, 0), radius * 0.32, radius * 0.32)
+
+
+class Chevron(QWidget):
+    """ Small '<' arrow (points to the left = 'go forward' in a right-to-left window). """
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(14, 20)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor("#8a96ad"), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.drawPolyline(QPolygonF([QPointF(10, 4), QPointF(4, 10), QPointF(10, 16)]))
+
+
+class RadioDot(QWidget):
+    """ Round radio indicator for the report-level cards. """
+    def __init__(self):
+        super().__init__()
+        self._on = False
+        self.setFixedSize(20, 20)
+
+    def set_on(self, on):
+        self._on = on
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor("#2f7dff" if self._on else "#b8c5dc"), 2))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(QPointF(10, 10), 8, 8)
+        if self._on:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#2f7dff"))
+            p.drawEllipse(QPointF(10, 10), 4.5, 4.5)
+
+
+class ClickableFrame(QFrame):
+    """ A frame that behaves like a button. """
+    clicked = pyqtSignal()
+
+    def __init__(self, object_name):
+        super().__init__()
+        self.setObjectName(object_name)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.pos()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
+class SettingCard(ClickableFrame):
+    """ One card of the settings home page: icon, title, description, live status line, arrow. """
+    def __init__(self, icon_kind, title, description):
+        super().__init__("settingCard")
+        self.setMinimumHeight(SETTING_CARD_MIN_HEIGHT)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(12)
+        texts = QVBoxLayout()
+        texts.setSpacing(2)
+        name = QLabel(title)
+        name.setObjectName("cardName")
+        desc = QLabel(description)
+        desc.setObjectName("muted")
+        desc.setWordWrap(True)
+        self.status_label = QLabel()
+        self.status_label.setObjectName("muted")
+        self.status_label.setWordWrap(True)
+        texts.addWidget(name)
+        texts.addWidget(desc)
+        texts.addSpacing(2)
+        texts.addWidget(self.status_label)
+        layout.addWidget(IconTile(icon_kind, 46))
+        layout.addLayout(texts, 1)
+        layout.addWidget(Chevron())
+
+    def set_status(self, text, ok=True):
+        color = "#1e9e5a" if ok else "#d98200"
+        self.status_label.setText(f'<span style="color:{color}">●&nbsp;&nbsp;{text}</span>')
+
+
+class ChoiceCard(ClickableFrame):
+    """ A selectable card (like a radio button) that lists what a report level contains. """
+    def __init__(self, title, tagline, items, footer):
+        super().__init__("choiceCard")
+        self.setProperty("selected", False)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(6)
+        head = QHBoxLayout()
+        self.dot = RadioDot()
+        name = QLabel(title)
+        name.setObjectName("cardName")
+        head.addWidget(self.dot)
+        head.addWidget(name)
+        head.addStretch(1)
+        layout.addLayout(head)
+        tag = QLabel(tagline)
+        tag.setObjectName("muted")
+        tag.setWordWrap(True)
+        layout.addWidget(tag)
+        layout.addSpacing(4)
+        includes = QLabel("شامل:")
+        includes.setObjectName("boldSmall")
+        layout.addWidget(includes)
+        for text in items:
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            bullet = QLabel("•")
+            bullet.setFixedWidth(10)
+            label = QLabel(text)
+            label.setWordWrap(True)
+            row.addWidget(bullet, 0, Qt.AlignTop)
+            row.addWidget(label, 1)
+            layout.addLayout(row)
+        layout.addStretch(1)
+        foot = QLabel(footer)
+        foot.setObjectName("muted")
+        foot.setWordWrap(True)
+        layout.addWidget(foot)
+
+    def set_selected(self, selected):
+        self.setProperty("selected", selected)
+        self.dot.set_on(selected)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+REPORT_LEVELS = {
+    "summary": ("خلاصه", "فقط نتیجه‌ی کار، بدون جزئیات مراحل", [
+        "شروع پردازش هر سفارش",
+        "خطاها و هشدارها (مثلاً نقشه‌ی فنی یافت نشد یا کد محصول نامعتبر)",
+        "فایل‌های نهایی ساخته‌شده برای هر سفارش",
+        "پیام پایان پردازش",
+    ], "مناسب برای استفاده‌ی روزمره"),
+    "detailed": ("کامل", "همه‌ی مراحل، قدم به قدم", [
+        "همه‌ی موارد سطح «خلاصه»",
+        "شماره سفارش‌های واردشده، دریافت از ERP و تعداد اقلام",
+        "بررسی هر کد محصول و قطعات جانبی",
+        "کپی نقشه‌های فنی و استخراج داده‌های اکسل آماده‌سازی",
+        "چاپ هر برگه و پاک‌سازی فایل‌های موقت",
+    ], "مناسب برای بررسی مشکل و عیب‌یابی"),
+}
+
 
 class SettingsDialog(QDialog):
-    """ Dialog window for application settings. """
+    """ Settings window: a home page with four cards, each opening its own page. """
     def __init__(self, config_manager, parent=None):
         super().__init__(parent)
         self.config_manager = config_manager
+        self.report_level = "detailed"
         self.setWindowTitle("ویژگی‌ها و تنظیمات")
         self.setWindowIcon(QIcon(resource_path("icon.ico")))
         self.setLayoutDirection(Qt.RightToLeft)
-        self.setMinimumWidth(700)
+        self.setMinimumWidth(SETTINGS_DIALOG_WIDTH)
+        self.setStyleSheet(SETTINGS_STYLESHEET.replace("__CHECK_IMAGE__", _check_mark_style()))     # set first, so every widget is styled when it is created
 
-        self.layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.panel = QWidget()
+        self.panel.setObjectName("settingsPanel")    # the style sheet only targets this container
+        outer.addWidget(self.panel)
+        root = QVBoxLayout(self.panel)
+        root.setContentsMargins(20, 16, 20, 16)
+        root.setSpacing(12)
 
-        paths_group = QGroupBox("تنظیمات مسیرها")
-        paths_layout = QVBoxLayout()
-        self.path_widgets = {
-            "database_file_path": self._create_path_selector("فایل اکسل مهندسی (.xlsm):", "file"),
-            "output_base_path": self._create_path_selector("پوشه ذخیره خروجی:", "folder"),
-        }
-        for _, widget_tuple in self.path_widgets.items():
-            paths_layout.addLayout(widget_tuple[0])
-        paths_group.setLayout(paths_layout)
-        self.layout.addWidget(paths_group)
+        self.pages = QStackedWidget()
+        self.cards = {}
+        self.pages.addWidget(self._build_home_page())      # 0
+        self.pages.addWidget(self._build_erp_page())       # 1
+        self.pages.addWidget(self._build_paths_page())     # 2
+        self.pages.addWidget(self._build_options_page())   # 3
+        self.pages.addWidget(self._build_report_page())    # 4
+        root.addWidget(self.pages, 1)
 
-        sql_group = QGroupBox("اتصال به پایگاه داده ERP")
-        sql_layout = QVBoxLayout()
+        bottom = QHBoxLayout()                              # right to left: About ... Save
+        self.about_button = QPushButton("درباره برنامه")
+        self.about_button.setObjectName("secondary")
+        self.save_button = QPushButton("ذخیره تنظیمات")
+        self.save_button.setObjectName("primary")
+        bottom.addWidget(self.about_button)
+        bottom.addStretch(1)
+        bottom.addWidget(self.save_button)
+        root.addLayout(bottom)
+
+        self._connect_signals()
+        self._populate_fields()
+        self._refresh_card_status()
+
+    # --------------------------------------------------------------------------
+    # Pages
+    # --------------------------------------------------------------------------
+    def _build_home_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        title = QLabel("تنظیمات")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel("تنظیمات برنامه و مسیرهای مورد نیاز")
+        subtitle.setObjectName("muted")
+        titles.addWidget(title)
+        titles.addWidget(subtitle)
+        header.addWidget(IconTile("gear", 40, tile=False, color="#6b87b8"))
+        header.addLayout(titles)
+        header.addStretch(1)
+        layout.addLayout(header)
+
+        grid = QGridLayout()                                # column 0 = right side (right-to-left)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(14)
+        cards = [
+            ("erp", "database", "اتصال به پایگاه‌داده", "تنظیمات اتصال به دیتابیس ERP", 1),
+            ("paths", "folder", "مسیرها", "تنظیم مسیرهای فایل‌ها و پوشه‌ها", 2),
+            ("options", "document", "گزینه‌های پردازش", "تنظیم رفتار و خروجی‌های برنامه", 3),
+            ("report", "report", "سطح گزارش‌ها", "تعیین سطح جزئیات گزارش پردازش", 4),
+        ]
+        for index, (key, icon, title_text, description, page_index) in enumerate(cards):
+            card = SettingCard(icon, title_text, description)
+            card.clicked.connect(lambda n=page_index: self.pages.setCurrentIndex(n))
+            grid.addWidget(card, index // 2, index % 2)
+            self.cards[key] = card
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        layout.addLayout(grid)
+        layout.addStretch(1)
+        return page
+
+    def _page_shell(self, title_text, icon_kind):
+        """ Common frame of an inner page: back button + title on top, a white box for the content. """
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        back = QPushButton(rtl_text("→  بازگشت"))
+        back.setObjectName("secondary")
+        back.clicked.connect(self._go_home)
+        title = QLabel(title_text)
+        title.setObjectName("pageTitle")
+        header.addWidget(back)
+        header.addWidget(IconTile(icon_kind, 36))
+        header.addWidget(title)
+        header.addStretch(1)
+        layout.addLayout(header)
+        box = QFrame()
+        box.setObjectName("sectionBox")
+        box_layout = QVBoxLayout(box)
+        box_layout.setContentsMargins(16, 14, 16, 14)
+        box_layout.setSpacing(10)
+        layout.addWidget(box)
+        layout.addStretch(1)
+        return page, box_layout
+
+    @staticmethod
+    def _add_row(layout, label_text, widget):
+        row = QHBoxLayout()
+        label = QLabel(label_text)
+        label.setObjectName("formLabel")
+        label.setFixedWidth(130)
+        row.addWidget(label)
+        row.addWidget(widget, 1)
+        layout.addLayout(row)
+
+    def _build_erp_page(self):
+        page, box = self._page_shell("اتصال به پایگاه‌داده", "database")
         self.sql_server_input = QLineEdit()
         self.sql_server_input.setPlaceholderText("مثال: localhost یا 192.168.1.10,1433 یا SERVER\\INSTANCE")
         self.sql_database_input = QLineEdit()
@@ -800,7 +1182,7 @@ class SettingsDialog(QDialog):
         self.sql_driver_input = QLineEdit()
         self.sql_driver_input.setPlaceholderText("نام درایور ODBC نصب‌شده")
         self.sql_auth_combo = QComboBox()
-        self.sql_auth_combo.addItem("احراز هویت ویندوز (Windows Authentication)", "windows")
+        self.sql_auth_combo.addItem(rtl_text("احراز هویت ویندوز (Windows Authentication)"), "windows")
         self.sql_auth_combo.addItem("نام کاربری و رمز SQL Server", "sql")
         self.sql_username_input = QLineEdit()
         self.sql_username_input.setPlaceholderText("نام کاربری SQL؛ برای ویندوز خالی بماند")
@@ -808,98 +1190,162 @@ class SettingsDialog(QDialog):
         self.sql_password_input.setEchoMode(QLineEdit.Password)
         self.sql_password_input.setPlaceholderText("برای تغییر رمز وارد کنید؛ خالی = استفاده از رمز ذخیره‌شده")
         self.sql_password_input.setToolTip("رمز در Windows Credential Manager ذخیره می‌شود، نه در config.json.")
-
-        def add_sql_row(label_text, widget):
-            row = QHBoxLayout()
-            label = QLabel(label_text)
-            label.setFixedWidth(150)
-            row.addWidget(label)
-            row.addWidget(widget, 1)
-            sql_layout.addLayout(row)
-
-        add_sql_row("آدرس سرور:", self.sql_server_input)
-        add_sql_row("نام پایگاه داده:", self.sql_database_input)
-        add_sql_row("درایور ODBC:", self.sql_driver_input)
-        add_sql_row("روش ورود:", self.sql_auth_combo)
-        add_sql_row("نام کاربری:", self.sql_username_input)
-        add_sql_row("رمز عبور:", self.sql_password_input)
-        sql_buttons = QHBoxLayout()
+        self._add_row(box, "آدرس سرور:", self.sql_server_input)
+        self._add_row(box, "نام پایگاه داده:", self.sql_database_input)
+        self._add_row(box, "درایور ODBC:", self.sql_driver_input)
+        self._add_row(box, "روش ورود:", self.sql_auth_combo)
+        self._add_row(box, "نام کاربری:", self.sql_username_input)
+        self._add_row(box, "رمز عبور:", self.sql_password_input)
+        buttons = QHBoxLayout()
         self.test_sql_button = QPushButton("آزمایش اتصال")
-        self.test_sql_button.setObjectName("actionButton")
+        self.test_sql_button.setObjectName("secondary")
         self.test_sql_button.clicked.connect(self._test_sql_connection)
-        sql_buttons.addWidget(self.test_sql_button)
-        sql_buttons.addStretch()
-        sql_layout.addLayout(sql_buttons)
-        sql_group.setLayout(sql_layout)
-        self.layout.addWidget(sql_group)
+        buttons.addWidget(self.test_sql_button)
+        buttons.addStretch(1)
+        box.addLayout(buttons)
+        return page
 
-        options_group = QGroupBox("گزینه‌های پردازش")
-        options_layout = QVBoxLayout()
-        
-        # U+202B ... U+202C force right-to-left reading order, so labels that mix Persian and
-        # English (like "فایل PDF ...") show in the correct word order. Just edit the text inside.
-        def rtl(text):
-            return "\u202b" + text + "\u202c"
+    def _build_paths_page(self):
+        page, box = self._page_shell("مسیرها", "folder")
+        self.path_widgets = {
+            "database_file_path": self._create_path_selector("فایل اکسل مهندسی (.xlsm):", "file"),
+            "output_base_path": self._create_path_selector("پوشه ذخیره خروجی:", "folder"),
+        }
+        for layout, _ in self.path_widgets.values():
+            box.addLayout(layout)
+        return page
 
-        self.print_prep_pdf_checkbox = QCheckBox(rtl("فایل PDF آماده سازی چاپ شود"))
-        self.print_timing_pdf_checkbox = QCheckBox(rtl("فایل PDF زمانسنجی چاپ شود"))
-        self.create_prep_excel_checkbox = QCheckBox(rtl("فایل اکسل آماده سازی ایجاد شود"))
-        self.delete_temp_checkbox = QCheckBox(rtl("پس از پایان پردازش، فایل‌های موقت پاک شوند"))
+    def _build_options_page(self):
+        page, box = self._page_shell("گزینه‌های پردازش", "document")
+        # rtl_text() keeps labels that mix Persian and English (like "فایل PDF ...") in reading order.
+        self.print_prep_pdf_checkbox = QCheckBox(rtl_text("فایل PDF آماده سازی چاپ شود"))
+        self.print_timing_pdf_checkbox = QCheckBox(rtl_text("فایل PDF زمانسنجی چاپ شود"))
+        self.create_prep_excel_checkbox = QCheckBox(rtl_text("فایل اکسل آماده سازی ایجاد شود"))
+        self.delete_temp_checkbox = QCheckBox(rtl_text("پس از پایان پردازش، فایل‌های موقت پاک شوند"))
+        # Two rows x two columns, grouped at the RIGHT edge. In this right-to-left window the first
+        # item of a horizontal layout is on the right and Qt.AlignLeading is the right edge, so the
+        # grid is added BEFORE the stretch.
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(28)
+        grid.setVerticalSpacing(14)
+        alignment = Qt.AlignLeading | Qt.AlignVCenter
+        grid.addWidget(self.print_prep_pdf_checkbox, 0, 0, alignment=alignment)
+        grid.addWidget(self.print_timing_pdf_checkbox, 0, 1, alignment=alignment)
+        grid.addWidget(self.create_prep_excel_checkbox, 1, 0, alignment=alignment)
+        grid.addWidget(self.delete_temp_checkbox, 1, 1, alignment=alignment)
+        row = QHBoxLayout()
+        row.addLayout(grid)
+        row.addStretch(1)
+        box.addLayout(row)
+        return page
 
-        # Two rows x two columns, grouped at the RIGHT edge of the box.
-        # This dialog is right-to-left, so: the first item added to a horizontal layout sits on the
-        # right, and Qt.AlignLeading means "start of the line" = the right edge. (Qt.AlignRight would
-        # be mirrored to the left in an RTL layout.) That is why the grid is added BEFORE the stretch.
-        checkboxes_layout = QGridLayout()
-        checkboxes_layout.setHorizontalSpacing(28)
-        checkboxes_layout.setVerticalSpacing(10)
-        checkbox_alignment = Qt.AlignLeading | Qt.AlignVCenter
-        checkboxes_layout.addWidget(self.print_prep_pdf_checkbox, 0, 0, alignment=checkbox_alignment)
-        checkboxes_layout.addWidget(self.print_timing_pdf_checkbox, 0, 1, alignment=checkbox_alignment)
-        checkboxes_layout.addWidget(self.create_prep_excel_checkbox, 1, 0, alignment=checkbox_alignment)
-        checkboxes_layout.addWidget(self.delete_temp_checkbox, 1, 1, alignment=checkbox_alignment)
+    def _build_report_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        back = QPushButton(rtl_text("→  بازگشت"))
+        back.setObjectName("secondary")
+        back.clicked.connect(self._go_home)
+        title = QLabel("سطح جزئیات گزارش پردازش")
+        title.setObjectName("pageTitle")
+        header.addWidget(back)
+        header.addWidget(IconTile("report", 36))
+        header.addWidget(title)
+        header.addStretch(1)
+        layout.addLayout(header)
 
-        options_row = QHBoxLayout()
-        options_row.addLayout(checkboxes_layout)
-        options_row.addStretch(1)
-        options_layout.addLayout(options_row)
-        options_group.setLayout(options_layout)
-        self.layout.addWidget(options_group)
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        self.level_cards = {}
+        for level in ("summary", "detailed"):                # right to left: summary, detailed
+            name, tagline, items, footer = REPORT_LEVELS[level]
+            card = ChoiceCard(name, tagline, items, footer)
+            card.clicked.connect(lambda lv=level: self._set_report_level(lv))
+            row.addWidget(card, 1)
+            self.level_cards[level] = card
+        layout.addLayout(row, 1)
+        note = QLabel("خطاها و هشدارها در هر دو سطح نمایش داده می‌شوند. این تنظیم از پردازش بعدی اعمال می‌شود.")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        return page
 
-        bottom_buttons_layout = QHBoxLayout()
-        self.about_button = QPushButton("درباره برنامه")
-        self.about_button.setObjectName("secondary")
-        self.save_button = QPushButton("ذخیره تنظیمات")
-        
-        bottom_buttons_layout.addWidget(self.about_button)
-        bottom_buttons_layout.addStretch()
-        bottom_buttons_layout.addWidget(self.save_button)
-        self.layout.addLayout(bottom_buttons_layout)
+    # --------------------------------------------------------------------------
+    # Navigation, live status
+    # --------------------------------------------------------------------------
+    def _go_home(self):
+        self.pages.setCurrentIndex(0)
 
-        self._connect_signals()
-        self._populate_fields()
-        self.setStyleSheet(DIALOG_STYLESHEET)
+    def keyPressEvent(self, event):
+        """ Esc goes back to the home page first; on the home page it closes the window. """
+        if event.key() == Qt.Key_Escape and self.pages.currentIndex() != 0:
+            self._go_home()
+            return
+        super().keyPressEvent(event)
 
+    def _set_report_level(self, level):
+        self.report_level = level
+        for key, card in self.level_cards.items():
+            card.set_selected(key == level)
+        self._refresh_card_status()
+
+    def _refresh_card_status(self):
+        """ Updates the status line of every card and remembers which sections are incomplete. """
+        self.incomplete_sections = []
+
+        missing = []
+        if not self.sql_server_input.text().strip():
+            missing.append("آدرس سرور")
+        if not self.sql_database_input.text().strip():
+            missing.append("نام پایگاه داده")
+        if not self.sql_driver_input.text().strip():
+            missing.append("درایور ODBC")
+        if self.sql_auth_combo.currentData() == "sql" and not self.sql_username_input.text().strip():
+            missing.append("نام کاربری")
+        if missing:
+            self.incomplete_sections.append("اتصال به پایگاه‌داده")
+            self.cards["erp"].set_status("ناقص: " + "، ".join(missing), False)
+        else:
+            self.cards["erp"].set_status("تنظیم شده: " + self.sql_database_input.text().strip())
+
+        missing = []
+        if not self.path_widgets["database_file_path"][1].text().strip():
+            missing.append("فایل اکسل مهندسی")
+        if not self.path_widgets["output_base_path"][1].text().strip():
+            missing.append("پوشه خروجی")
+        if missing:
+            self.incomplete_sections.append("مسیرها")
+            self.cards["paths"].set_status("ناقص: " + "، ".join(missing), False)
+        else:
+            self.cards["paths"].set_status("هر دو مسیر تنظیم شده است")
+
+        boxes = (self.print_prep_pdf_checkbox, self.print_timing_pdf_checkbox,
+                 self.create_prep_excel_checkbox, self.delete_temp_checkbox)
+        self.cards["options"].set_status(f"{fa_digits(sum(box.isChecked() for box in boxes))} از ۴ گزینه فعال")
+        self.cards["report"].set_status("سطح فعلی: " + REPORT_LEVELS[self.report_level][0])
+
+    # --------------------------------------------------------------------------
+    # Fields
+    # --------------------------------------------------------------------------
     def _create_path_selector(self, label_text, selection_mode):
         """ Creates a layout for path selection with a label, line edit, and browse button. """
         layout = QHBoxLayout()
-        label = QLabel(label_text)
-        label.setFixedWidth(150)
+        label = QLabel(rtl_text(label_text))
+        label.setObjectName("formLabel")
+        label.setFixedWidth(160)
         line_edit = QLineEdit()
-
-        browse_button = QPushButton("انتخاب مسیر ⤷")
-        browse_button.setObjectName("actionButton")
-        browse_button.setFixedWidth(90)
-        
+        browse_button = QPushButton("انتخاب مسیر")
+        browse_button.setObjectName("secondary")
         layout.addWidget(label)
-        layout.addWidget(line_edit)
+        layout.addWidget(line_edit, 1)
         layout.addWidget(browse_button)
-        
         if selection_mode == "file":
             browse_button.clicked.connect(lambda: self._browse_file(line_edit))
         else:
             browse_button.clicked.connect(lambda: self._browse_folder(line_edit))
-            
         return layout, line_edit
 
     def _browse_file(self, line_edit):
@@ -919,7 +1365,7 @@ class SettingsDialog(QDialog):
         settings = self.config_manager.settings
         for key, widget_tuple in self.path_widgets.items():
             widget_tuple[1].setText(settings.get(key, ""))
-        
+
         self.sql_server_input.setText(settings.get("sql_server", "localhost"))
         self.sql_database_input.setText(settings.get("sql_database", "FARDAN_OLTP"))
         self.sql_driver_input.setText(settings.get("sql_driver", "ODBC Driver 18 for SQL Server"))
@@ -932,18 +1378,27 @@ class SettingsDialog(QDialog):
         self.print_timing_pdf_checkbox.setChecked(settings.get("print_timing_pdf", True))
         self.create_prep_excel_checkbox.setChecked(settings.get("create_preparation_excel", True))
         self.delete_temp_checkbox.setChecked(settings.get("delete_temp_files", True))
-        
+
+        level = settings.get("report_level", "detailed")
+        self._set_report_level(level if level in REPORT_LEVELS else "detailed")
 
     def _connect_signals(self):
         """ Connects widget signals to their respective slots. """
         self.save_button.clicked.connect(self.accept)
         self.about_button.clicked.connect(self._show_about)
+        for edit in (self.sql_server_input, self.sql_database_input, self.sql_driver_input, self.sql_username_input,
+                     self.path_widgets["database_file_path"][1], self.path_widgets["output_base_path"][1]):
+            edit.textChanged.connect(self._refresh_card_status)
+        self.sql_auth_combo.currentIndexChanged.connect(self._refresh_card_status)
+        for box in (self.print_prep_pdf_checkbox, self.print_timing_pdf_checkbox,
+                    self.create_prep_excel_checkbox, self.delete_temp_checkbox):
+            box.toggled.connect(self._refresh_card_status)
 
     def _save_settings(self):
         """ Saves the current settings from the dialog to the config manager. """
         for key, widget_tuple in self.path_widgets.items():
             self.config_manager.settings[key] = widget_tuple[1].text()
-        
+
         settings = self.config_manager.settings
         settings["sql_server"] = self.sql_server_input.text().strip()
         settings["sql_database"] = self.sql_database_input.text().strip()
@@ -959,10 +1414,11 @@ class SettingsDialog(QDialog):
             )
 
         settings["print_preparation_pdf"] = self.print_prep_pdf_checkbox.isChecked()
-        self.config_manager.settings["print_timing_pdf"] = self.print_timing_pdf_checkbox.isChecked()
-        self.config_manager.settings["create_preparation_excel"] = self.create_prep_excel_checkbox.isChecked()
-        self.config_manager.settings["delete_temp_files"] = self.delete_temp_checkbox.isChecked()
-        
+        settings["print_timing_pdf"] = self.print_timing_pdf_checkbox.isChecked()
+        settings["create_preparation_excel"] = self.create_prep_excel_checkbox.isChecked()
+        settings["delete_temp_files"] = self.delete_temp_checkbox.isChecked()
+        settings["report_level"] = self.report_level
+
         self.config_manager.save()
 
     def _test_sql_connection(self):
@@ -980,7 +1436,7 @@ class SettingsDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(
                 self, "اتصال ناموفق",
-                "اتصال به SQL Server برقرار نشد. آدرس، پورت، نام دیتابیس، درایور و مجوز ورود را بررسی کنید.\\n\\n"
+                "اتصال به SQL Server برقرار نشد. آدرس، پورت، نام دیتابیس، درایور و مجوز ورود را بررسی کنید.\n\n"
                 f"جزئیات: {exc}",
             )
             return
@@ -993,16 +1449,20 @@ class SettingsDialog(QDialog):
         except Exception as exc:
             QMessageBox.critical(
                 self, "ذخیره تنظیمات ناموفق",
-                "تنظیمات ذخیره نشد. امکان ذخیره امن رمز در Windows Credential Manager وجود نداشت.\\n\\n"
+                "تنظیمات ذخیره نشد. امکان ذخیره امن رمز در Windows Credential Manager وجود نداشت.\n\n"
                 f"جزئیات: {exc}",
             )
             return
-        QMessageBox.information(self, "ذخیره شد", "تنظیمات با موفقیت ذخیره شد.")
+        message = "تنظیمات با موفقیت ذخیره شد."
+        if self.incomplete_sections:
+            message += "\n\nتوجه: این بخش‌ها هنوز ناقص‌اند: " + "، ".join(self.incomplete_sections)
+        QMessageBox.information(self, "ذخیره شد", message)
         super().accept()
 
     def _show_about(self):
         """ Shows the 'About' dialog. """
         dlg = QDialog(self)
+        dlg.setStyleSheet(ABOUT_STYLESHEET)
         dlg.setWindowTitle("About")
         dlg.setFixedSize(500, 450)
 
